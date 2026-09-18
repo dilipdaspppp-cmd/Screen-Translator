@@ -4,6 +4,7 @@
     <string name="start_translation">অনুবাদ শুরু করুন</string>
     <string name="stop_translation">অনুবাদ বন্ধ করুন</string>
     <string name="settings">সেটিংস</string>
+    <string name="exit_text">প্রস্থান (সম্পূর্ণ বন্ধ)</string>
     <string name="status_idle">অপেক্ষমান...</string>
     <string name="status_translating">অনুবাদ চলছে...</string>
     <string name="status_waiting">সব লিমিট শেষ, অপেক্ষা করছি...</string>
