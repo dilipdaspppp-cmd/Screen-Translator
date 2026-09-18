@@ -11,6 +11,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -56,6 +57,7 @@ class TranslationService : Service() {
     private var pendingCapture = false
     private var serviceOn = false
     private var buttonSize = 1
+    private var minBoxHeight = 1
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -70,7 +72,7 @@ class TranslationService : Service() {
         createNotificationChannel()
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Translator")
-            .setContentText("ফ্লোটিং বাটন চালু আছে")
+            .setContentText(getString(R.string.status_translating))
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .build()
         startForeground(NOTIFICATION_ID, notification)
@@ -78,6 +80,7 @@ class TranslationService : Service() {
         val metrics = resources.displayMetrics
         screenWidth = metrics.widthPixels
         screenHeight = metrics.heightPixels
+        minBoxHeight = dpToPx(11)
         windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
 
         setupOverlayImage()
@@ -87,14 +90,6 @@ class TranslationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            "START_TRANSLATION" -> {
-                val resultCode = intent.getIntExtra("resultCode", -1)
-                val data = intent.getParcelableExtra<Intent>("data")
-                if (resultCode != -1 && data != null && mediaProjection == null) {
-                    initProjection(resultCode, data)
-                }
-                Toast.makeText(this, "ফ্লোটিং বাটনে চাপ দিন, অনুবাদ হবে", Toast.LENGTH_LONG).show()
-            }
             "PROJECTION_RESULT" -> {
                 val resultCode = intent.getIntExtra("resultCode", -1)
                 val data = intent.getParcelableExtra<Intent>("data")
@@ -118,7 +113,7 @@ class TranslationService : Service() {
         mediaProjection = manager.getMediaProjection(resultCode, data)
 
         if (mediaProjection == null) {
-            Toast.makeText(this, "স্ক্রিন ক্যাপচার অনুমতি পাওয়া যায়নি", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.msg_no_screen), Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -138,9 +133,9 @@ class TranslationService : Service() {
             setColor(Color.parseColor("#2196F3"))
         }
         buttonView = TextView(this).apply {
-            text = "অ"
+            text = getString(R.string.button_label)
             setTextColor(Color.WHITE)
-            textSize = 16f
+            textSize = 14f
             gravity = Gravity.CENTER
             background = buttonBg
         }
@@ -206,7 +201,6 @@ class TranslationService : Service() {
                         if (!moved && dt < 500) {
                             onButtonTap()
                         } else if (!moved && dt >= 500) {
-                            Toast.makeText(this@TranslationService, "সার্ভিস বন্ধ হচ্ছে", Toast.LENGTH_SHORT).show()
                             stopAll()
                         }
                         return true
@@ -232,8 +226,7 @@ class TranslationService : Service() {
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-        wm.addView(overlayImage, params)
+        windowManager?.addView(overlayImage, params)
     }
 
     private fun onButtonTap() {
@@ -251,7 +244,6 @@ class TranslationService : Service() {
         if (mediaProjection == null) {
             pendingCapture = true
             setButtonColor("#FF9800")
-            Toast.makeText(this, "একবার অনুমতি দিন, তারপর নিজে থেকেই অনুবাদ হবে", Toast.LENGTH_LONG).show()
             val i = Intent(this, CaptureActivity::class.java)
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(i)
@@ -259,7 +251,6 @@ class TranslationService : Service() {
         }
         isCapturing = true
         setButtonColor("#FF9800")
-        Toast.makeText(this, "অনুবাদ হচ্ছে...", Toast.LENGTH_SHORT).show()
         buttonView?.visibility = View.GONE
         overlayImage?.visibility = View.INVISIBLE
         handler.postDelayed({ captureNow(0) }, 500)
@@ -274,7 +265,7 @@ class TranslationService : Service() {
                 isCapturing = false
                 buttonView?.visibility = View.VISIBLE
                 setButtonColor("#2196F3")
-                Toast.makeText(this, "স্ক্রিন ধরা যায়নি, আবার চাপ দিন", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.msg_no_screen), Toast.LENGTH_SHORT).show()
             }
             return
         }
@@ -302,7 +293,7 @@ class TranslationService : Service() {
 
         if (keys.isEmpty() || models.isEmpty()) {
             handler.post {
-                Toast.makeText(this, "সেটিংসে key বা model নেই", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.msg_no_key), Toast.LENGTH_SHORT).show()
                 isCapturing = false
                 setButtonColor("#2196F3")
             }
@@ -342,16 +333,13 @@ class TranslationService : Service() {
                 isOverlayShowing = true
                 isCapturing = false
                 setButtonColor("#4CAF50")
-                Toast.makeText(this, "অনুবাদ সম্পন্ন", Toast.LENGTH_SHORT).show()
             }
         } else {
             handler.post {
-                Toast.makeText(this, "সব লিমিট শেষ, ১ মিনিট পর আবার চেষ্টা করছি", Toast.LENGTH_LONG).show()
+                isCapturing = false
+                setButtonColor("#2196F3")
+                Toast.makeText(this, getString(R.string.msg_failed), Toast.LENGTH_LONG).show()
             }
-            Thread.sleep(60000)
-            currentKeyIndex = 0
-            currentModelIndex = 0
-            handler.post { captureNow(0) }
         }
     }
 
@@ -361,13 +349,13 @@ class TranslationService : Service() {
             bitmap.compress(Bitmap.CompressFormat.PNG, 70, outputStream)
             val base64Image = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
-            val prompt = "এই ছবির সব লেখা শনাক্ত করো এবং বাংলায় অনুবাদ করো। " +
-                    "প্রতিটি লেখার জন্য একটি করে entry দাও। " +
-                    "উত্তর অবশ্যই valid JSON হবে, structure এমন: " +
-                    "translations নামে একটি array, প্রতিটি item এ original_text, translated_text, " +
-                    "এবং box নামে object যার ভেতরে x, y, width, height। " +
-                    "box এর মান 0 থেকে 1000 স্কেলে দিও, ছবির বাম-উপর কোণা থেকে ধরে। " +
-                    "JSON ছাড়া অন্য কিছু লিখবে না।"
+            val nl = CHAR_NL.toString()
+            val prompt = "এই স্ক্রিনশটের সব লেখা খুঁজে বের করে সহজ বাংলায় অনুবাদ করো।" + nl +
+                    "সংখ্যা, নাম, ইমেইল ও লিংক অপরিবর্তিত রাখবে।" + nl +
+                    "উত্তর হবে শুধুমাত্র valid JSON। structure: translations নামে একটি array, " +
+                    "প্রতিটি item এ original_text, translated_text এবং box থাকবে। " +
+                    "box একটি object যার ভেতরে x, y, width, height থাকবে। " +
+                    "box এর মান 0 থেকে 1000 এর ভেতরে হবে। JSON ছাড়া অন্য কিছু লিখবে না।"
 
             val json = JSONObject().apply {
                 put("contents", JSONArray().apply {
@@ -422,44 +410,86 @@ class TranslationService : Service() {
         return null
     }
 
+    private data class Box(val text: String, val rect: Rect)
+
+    private fun separate(list: List<Box>): List<Box> {
+        val ordered = list.sortedWith(Comparator { a, b ->
+            if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
+        })
+        val out = ArrayList<Box>()
+        for (item in ordered) {
+            val r = Rect(item.rect)
+            for (old in out) {
+                if (r.right <= old.rect.left || r.left >= old.rect.right) continue
+                if (r.top >= old.rect.bottom || r.bottom <= old.rect.top) continue
+                if (r.top >= old.rect.top) {
+                    r.top = old.rect.bottom
+                } else {
+                    r.bottom = old.rect.top
+                }
+            }
+            if (r.width() > 0 && r.height() >= minBoxHeight) {
+                out.add(Box(item.text, r))
+            }
+        }
+        return out
+    }
+
     private fun drawAndShowOverlay(responseText: String) {
         try {
             val json = JSONObject(responseText)
             val translations = json.getJSONArray("translations")
 
-            val bitmap = Bitmap.createBitmap(screenWidth, screenHeight, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-
+            val boxes = ArrayList<Box>()
             for (i in 0 until translations.length()) {
                 val item = translations.getJSONObject(i)
                 val translatedText = item.optString("translated_text", "")
                 if (translatedText.isBlank()) continue
-                val box = item.getJSONObject("box")
+                val box = item.optJSONObject("box") ?: continue
                 val nx = box.optDouble("x", 0.0)
                 val ny = box.optDouble("y", 0.0)
                 val nw = box.optDouble("width", 100.0)
                 val nh = box.optDouble("height", 50.0)
 
-                val left = (nx / 1000.0 * screenWidth).toFloat()
-                val top = (ny / 1000.0 * screenHeight).toFloat()
-                val right = left + (nw / 1000.0 * screenWidth).toFloat()
-                val bottom = top + (nh / 1000.0 * screenHeight).toFloat()
+                val left = (nx / 1000.0 * screenWidth).toInt()
+                val top = (ny / 1000.0 * screenHeight).toInt()
+                val right = left + (nw / 1000.0 * screenWidth).toInt()
+                val bottom = top + (nh / 1000.0 * screenHeight).toInt()
+                val r = Rect(left, top, right, bottom)
+                if (r.intersect(Rect(0, 0, screenWidth, screenHeight))) {
+                    boxes.add(Box(translatedText, r))
+                }
+            }
+
+            val clean = separate(boxes)
+
+            val bitmap = Bitmap.createBitmap(screenWidth, screenHeight, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            val bgPaint = Paint().apply { color = Color.rgb(22, 22, 22) }
+
+            for (item in clean) {
+                val left = item.rect.left.toFloat()
+                val top = item.rect.top.toFloat()
+                val right = item.rect.right.toFloat()
+                val bottom = item.rect.bottom.toFloat()
                 val boxWidth = right - left
                 val boxHeight = bottom - top
 
-                val bgPaint = Paint().apply { color = Color.argb(220, 20, 20, 20) }
                 canvas.drawRect(left, top, right, bottom, bgPaint)
 
                 val paint = Paint().apply {
                     color = Color.WHITE
                     isAntiAlias = true
-                    textSize = boxHeight * 0.75f
+                    textSize = boxHeight * 0.7f
                 }
-                while (paint.measureText(translatedText) > boxWidth && paint.textSize > 10f) {
-                    paint.textSize = paint.textSize - 2f
+                while (paint.measureText(item.text) > boxWidth - 6f && paint.textSize > 9f) {
+                    paint.textSize = paint.textSize - 1f
                 }
                 val baseline = top + boxHeight / 2f - (paint.descent() + paint.ascent()) / 2f
-                canvas.drawText(translatedText, left + 4f, baseline, paint)
+                canvas.save()
+                canvas.clipRect(left, top, right, bottom)
+                canvas.drawText(item.text, left + 3f, baseline, paint)
+                canvas.restore()
             }
 
             overlayImage?.setImageBitmap(bitmap)
@@ -553,5 +583,6 @@ class TranslationService : Service() {
     companion object {
         private const val CHANNEL_ID = "ScreenTranslatorChannel"
         private const val NOTIFICATION_ID = 1
+        private val CHAR_NL = Char(10)
     }
 }
