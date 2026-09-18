@@ -1,12 +1,39 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Screen Translator</string>
-    <string name="start_translation">অনুবাদ শুরু করুন</string>
+    <string name="start_translation">অনুবাদ চালু করুন</string>
     <string name="stop_translation">অনুবাদ বন্ধ করুন</string>
     <string name="settings">সেটিংস</string>
-    <string name="exit_text">প্রস্থান (সম্পূর্ণ বন্ধ)</string>
-    <string name="status_idle">অপেক্ষমান...</string>
-    <string name="status_translating">অনুবাদ চলছে...</string>
-    <string name="status_waiting">সব লিমিট শেষ, অপেক্ষা করছি...</string>
-    <string name="accessibility_desc">স্ক্রিনের লেখা পড়ে বাংলায় অনুবাদ দেখাতে এই সার্ভিস দরকার।</string>
+    <string name="exit_text">বন্ধ করুন (বাটন লুকান)</string>
+    <string name="status_idle">অপেক্ষায় আছে...</string>
+    <string name="status_translating">অনুবাদ চালু আছে...</string>
+    <string name="status_waiting">অনুমতির জন্য অপেক্ষা করা হচ্ছে...</string>
+    <string name="accessibility_desc">স্ক্রিনের লেখা পড়ে বাংলায় অনুবাদ দেখানোর জন্য এই সার্ভিসটি দরকার।</string>
+    <string name="button_label">অনু</string>
+    <string name="label_key">Key: None</string>
+    <string name="label_model">Model: None</string>
+    <string name="help_text">নিয়ম: প্রথমে সেটিংসে API key দিন, এরপর অনুবাদ চালু করুন। যেকোনো অ্যাপে ভাসমান বাটনে একবার চাপ দিলে অনুবাদ দেখাবে, আবার চাপ দিলে মিলিয়ে যাবে। বাটন চেপে ধরে রাখলে বাটনটি লুকিয়ে যাবে।</string>
+    <string name="api_keys_title">API Keys (৫টি)</string>
+    <string name="models_title">Models (চালু / বন্ধ)</string>
+    <string name="save_text">সেভ করুন</string>
+    <string name="hint_key_1">Key 1</string>
+    <string name="hint_key_2">Key 2</string>
+    <string name="hint_key_3">Key 3</string>
+    <string name="hint_key_4">Key 4</string>
+    <string name="hint_key_5">Key 5</string>
+    <string name="model_1">gemini-3.5-flash-lite</string>
+    <string name="model_2">gemini-3.1-flash-lite</string>
+    <string name="model_3">gemini-3-flash-preview</string>
+    <string name="msg_saved">সেটিংস সেভ হয়েছে।</string>
+    <string name="msg_exit">অ্যাপ বন্ধ হচ্ছে, ভাসমান বাটন সরিয়ে দেওয়া হলো।</string>
+    <string name="msg_need_overlay">স্ক্রিনের উপরে দেখানোর অনুমতি দিন।</string>
+    <string name="msg_need_accessibility">সেটিংস থেকে Screen Translator সার্ভিসটি On করুন।</string>
+    <string name="msg_ready">প্রস্তুত! যেকোনো অ্যাপে ভাসমান বাটনে চাপ দিন।</string>
+    <string name="msg_stopped">অনুবাদ বন্ধ করা হলো।</string>
+    <string name="msg_no_key">আগে সেটিংসে API key দিন এবং অন্তত একটি model চালু রাখুন।</string>
+    <string name="msg_no_text">এই স্ক্রিনে অনুবাদযোগ্য লেখা পাওয়া যায়নি।</string>
+    <string name="msg_no_screen">স্ক্রিন পড়া যাচ্ছে না, আবার চেষ্টা করুন।</string>
+    <string name="msg_own_app">নিজের অ্যাপের স্ক্রিন অনুবাদ হবে না, অন্য অ্যাপে গিয়ে চাপ দিন।</string>
+    <string name="msg_failed">অনুবাদ ব্যর্থ, সব key ও model চেষ্টা করা হয়েছে।</string>
+    <string name="msg_button_hidden">ভাসমান বাটন লুকানো হলো। অ্যাপ থেকে আবার চালু করুন।</string>
 </resources>
