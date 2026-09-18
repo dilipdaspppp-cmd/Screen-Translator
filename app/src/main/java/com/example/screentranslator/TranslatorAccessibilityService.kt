@@ -52,7 +52,7 @@ class OverlayView(context: Context) : View(context) {
     fun setEntries(list: List<Entry>) {
         val density = resources.displayMetrics.density
         val pad = 2f * density
-        val minSize = 9f * density
+        val minSize = 4f * density
         val out = ArrayList<Drawn>()
         for (en in list) {
             val w = en.rect.width()
@@ -552,60 +552,26 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return ((inter * 100L) / area).toInt()
     }
 
-    private fun estHeight(text: String, innerW: Int, size: Float): Pair<Int, Float> {
-        measurePaint.textSize = size
-        val total = measurePaint.measureText(text)
-        val fm = measurePaint.fontMetrics
-        var lineH = fm.descent - fm.ascent
-        if (lineH < 1f) lineH = 1f
-        val w = if (innerW < 4) 4 else innerW
-        var lines = Math.ceil((total / w).toDouble()).toInt()
-        if (lines < 1) lines = 1
-        lines = lines + 1
-        return Pair((lines * lineH).toInt(), lineH)
-    }
-
     private fun layoutBoxes(list: List<Item>): List<Item> {
         val d = resources.displayMetrics.density
-        val padSide = Math.max(2, (2f * d).toInt())
         val gap = Math.max(2, (2f * d).toInt())
         val margin = Math.max(2, (3f * d).toInt())
-        val minSize = 9f * d
         val hardMax = 26f * d
         val maxW = screenWidth - margin * 2
-        val minW = dpToPx(60)
         val rightZone = screenWidth - dpToPx(24)
         val sorted = list.sortedWith(Comparator { a, b ->
             if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
         })
         val placed = ArrayList<Item>()
         for (cand in sorted) {
+            // মূল লেখা যত ছোট ছিল, বাক্সও ততটুকুই থাকবে — অনুবাদের জন্য বড় করা হবে না।
+            // লেখা না ধরলে ফন্ট সাইজ ছোট হবে (OverlayView.setEntries), বাক্স নয়।
             var size = cand.srcSize
-            if (size < minSize) size = minSize
             if (size > hardMax) size = hardMax
             val orig = cand.rect
-            measurePaint.textSize = size
-            val singleW = Math.ceil(measurePaint.measureText(cand.text).toDouble()).toInt() + padSide * 2
-            var baseW = orig.width()
-            if (baseW < minW) baseW = minW
-            if (baseW > maxW) baseW = maxW
-            var boxW = if (singleW > baseW) singleW else baseW
+            var boxW = orig.width()
             if (boxW > maxW) boxW = maxW
-            var guard = 0
-            var res = estHeight(cand.text, boxW - padSide * 2, size)
-            var lineH = res.second
-            var capH = (lineH * BOX_MAX_LINES.toFloat()).toInt() + padSide * 2
-            while (guard < 40 && size > minSize && res.first + padSide * 2 > capH) {
-                size = size - 1f
-                if (size < minSize) size = minSize
-                res = estHeight(cand.text, boxW - padSide * 2, size)
-                lineH = res.second
-                capH = (lineH * BOX_MAX_LINES.toFloat()).toInt() + padSide * 2
-                guard++
-            }
-            var boxH = res.first + padSide * 2
-            if (boxH > capH) boxH = capH
-            if (boxH < orig.height()) boxH = orig.height()
+            var boxH = orig.height()
             if (boxH < minBoxHeight) boxH = minBoxHeight
             val rightAnchored = orig.right >= rightZone
             var left: Int
