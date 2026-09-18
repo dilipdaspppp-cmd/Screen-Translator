@@ -129,6 +129,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var screenHeight = 1
     private var isWorking = false
     private var isOverlayShowing = false
+    private var overlayShownAt = 0L
     private var buttonSize = 1
     private var uiReady = false
 
@@ -174,7 +175,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val type = event?.eventType ?: return
+        if (event == null) return
+        val pkg = event.packageName?.toString() ?: ""
+        if (pkg == packageName) return
+        val type = event.eventType
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             type == AccessibilityEvent.TYPE_VIEW_SCROLLED
         ) {
@@ -186,11 +190,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
     override fun onInterrupt() { }
 
     private fun hideOverlayIfShowing() {
-        if (isOverlayShowing) {
-            overlayView?.visibility = View.INVISIBLE
-            isOverlayShowing = false
-            setButtonColor("#2196F3")
-        }
+        if (!isOverlayShowing) return
+        val since = System.currentTimeMillis() - overlayShownAt
+        if (since < 1000) return
+        overlayView?.visibility = View.INVISIBLE
+        isOverlayShowing = false
+        setButtonColor("#2196F3")
     }
 
     private fun syncUiState() {
@@ -323,7 +328,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun translateNow() {
         isWorking = true
         setButtonColor("#FF9800")
-        Toast.makeText(this, "অনুবাদ হচ্ছে...", Toast.LENGTH_SHORT).show()
         buttonView?.visibility = View.GONE
         overlayView?.visibility = View.INVISIBLE
         handler.postDelayed({ collectAndTranslate() }, 250)
@@ -439,10 +443,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
             handler.post {
                 showOverlay(finalText, items)
                 isOverlayShowing = true
+                overlayShownAt = System.currentTimeMillis()
                 isWorking = false
                 setButtonColor("#4CAF50")
                 saveError("")
-                Toast.makeText(this, "অনুবাদ সম্পন্ন", Toast.LENGTH_SHORT).show()
             }
         } else {
             saveError("সর্বশেষ এরর: HTTP " + lastCode)
