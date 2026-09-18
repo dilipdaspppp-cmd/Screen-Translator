@@ -7,4 +7,5 @@
     <string name="status_idle">অপেক্ষমান...</string>
     <string name="status_translating">অনুবাদ চলছে...</string>
     <string name="status_waiting">সব লিমিট শেষ, অপেক্ষা করছি...</string>
+    <string name="accessibility_desc">স্ক্রিনের লেখা পড়ে বাংলায় অনুবাদ দেখাতে এই সার্ভিস দরকার।</string>
 </resources>
