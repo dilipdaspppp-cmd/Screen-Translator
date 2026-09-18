@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:padding="16dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="API Keys (5টি)"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="16dp" />
+
+        <EditText
+            android:id="@+id/etKey1"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Key 1"
+            android:inputType="text"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/etKey2"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Key 2"
+            android:inputType="text"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/etKey3"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Key 3"
+            android:inputType="text"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/etKey4"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Key 4"
+            android:inputType="text"
+            android:layout_marginBottom="8dp" />
+
+        <EditText
+            android:id="@+id/etKey5"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Key 5"
+            android:inputType="text"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Models (On/Off)"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="16dp" />
+
+        <CheckBox
+            android:id="@+id/cbModel1"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="gemini-3.5-flash-lite"
+            android:checked="true"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/cbModel2"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="gemini-3.1-flash-lite"
+            android:checked="true"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/cbModel3"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="gemini-3-flash-preview"
+            android:checked="true"
+            android:layout_marginBottom="24dp" />
+
+        <Button
+            android:id="@+id/btnSave"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="সেভ করুন"
+            android:textSize="18sp" />
+
+    </LinearLayout>
+
+</ScrollView>
