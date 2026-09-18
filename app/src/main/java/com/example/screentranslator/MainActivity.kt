@@ -18,6 +18,7 @@ class MainActivity : Activity() {
     private lateinit var tvCurrentModel: TextView
     private lateinit var btnStart: Button
     private lateinit var btnSettings: Button
+    private lateinit var btnExit: Button
     private var isTranslating = false
 
     private val pollHandler = Handler(Looper.getMainLooper())
@@ -37,6 +38,7 @@ class MainActivity : Activity() {
         tvCurrentModel = findViewById(R.id.tvCurrentModel)
         btnStart = findViewById(R.id.btnStart)
         btnSettings = findViewById(R.id.btnSettings)
+        btnExit = findViewById(R.id.btnExit)
 
         btnStart.setOnClickListener {
             if (!isTranslating) {
@@ -48,6 +50,14 @@ class MainActivity : Activity() {
 
         btnSettings.setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
+        btnExit.setOnClickListener {
+            getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+                .putBoolean("uiOff", true).apply()
+            sendBroadcast(Intent("com.example.screentranslator.EXIT"))
+            Toast.makeText(this, "সম্পূর্ণ বন্ধ হয়েছে। ব্যাটারি খরচ হবে না।", Toast.LENGTH_LONG).show()
+            finish()
         }
 
         updateUI()
@@ -88,7 +98,7 @@ class MainActivity : Activity() {
     private fun disableFlow() {
         getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
             .putBoolean("uiOff", true).apply()
-        Toast.makeText(this, "বন্ধ হয়েছে। আবার চালু করতে শুরু বাটনে চাপুন", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "লুকানো হয়েছে। আবার চালু করতে শুরু বাটনে চাপুন", Toast.LENGTH_SHORT).show()
         isTranslating = false
         updateUI()
     }
