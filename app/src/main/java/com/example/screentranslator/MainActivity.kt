@@ -3,28 +3,27 @@ package com.example.screentranslator
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.text.TextUtils
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
-    private lateinit var tvStatus: TextView
-    private lateinit var tvCurrentKey: TextView
-    private lateinit var tvCurrentModel: TextView
-    private lateinit var btnStart: Button
-    private lateinit var btnSettings: Button
-    private lateinit var btnExit: Button
-    private var isTranslating = false
+    private var tvStatus: TextView? = null
+    private var tvCurrentKey: TextView? = null
+    private var tvCurrentModel: TextView? = null
+    private var btnStart: Button? = null
+    private var btnSettings: Button? = null
+    private var btnExit: Button? = null
 
     private val pollHandler = Handler(Looper.getMainLooper())
     private val pollRunnable = object : Runnable {
         override fun run() {
-            updateComboText()
+            updateUI()
             pollHandler.postDelayed(this, 2000)
         }
     }
@@ -40,96 +39,92 @@ class MainActivity : Activity() {
         btnSettings = findViewById(R.id.btnSettings)
         btnExit = findViewById(R.id.btnExit)
 
-        btnStart.setOnClickListener {
-            if (!isTranslating) {
-                enableFlow()
-            } else {
-                disableFlow()
-            }
+        btnStart?.setOnClickListener {
+            if (isRunning()) startOrStop(false) else startOrStop(true)
         }
 
-        btnSettings.setOnClickListener {
-            startActivity(Intent(this, SettingsActivity::class.java))
+        btnSettings?.setOnClickListener {
+            try {
+                startActivity(Intent(this, SettingsActivity::class.java))
+            } catch (e: Exception) { }
         }
 
-        btnExit.setOnClickListener {
-            getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
-                .putBoolean("uiOff", true).apply()
-            sendBroadcast(Intent("com.example.screentranslator.EXIT"))
+        btnExit?.setOnClickListener {
+            prefs().edit().putBoolean("uiOff", true).apply()
+            val i = Intent("com.example.screentranslator.EXIT")
+            i.setPackage(packageName)
+            sendBroadcast(i)
             Toast.makeText(this, getString(R.string.msg_exit), Toast.LENGTH_LONG).show()
-            finish()
+            updateUI()
         }
 
         updateUI()
     }
+
+    private fun prefs() = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
 
     private fun accessibilityOn(): Boolean {
-        val enabled = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: ""
-        return enabled.contains("TranslatorAccessibilityService")
+        try {
+            val expected = packageName + "/" + TranslatorAccessibilityService::class.java.name
+            val enabled = Settings.Secure.getString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: return false
+            val splitter = TextUtils.SimpleStringSplitter(':')
+            splitter.setString(enabled)
+            while (splitter.hasNext()) {
+                val comp = splitter.next()
+                if (comp.equals(expected, true)) return true
+                if (comp.contains("TranslatorAccessibilityService")) return true
+            }
+        } catch (e: Exception) { }
+        return false
     }
 
-    private fun enableFlow() {
-        if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, getString(R.string.msg_need_overlay), Toast.LENGTH_LONG).show()
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:" + packageName)
-            )
-            startActivityForResult(intent, 1002)
-            return
-        }
+    private fun isRunning(): Boolean {
+        val off = prefs().getBoolean("uiOff", false)
+        return accessibilityOn() && !off
+    }
 
-        getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
-            .putBoolean("uiOff", false).apply()
+    private fun startOrStop(start: Boolean) {
+        prefs().edit().putBoolean("uiOff", !start).apply()
+        val sync = Intent("com.example.screentranslator.SYNC")
+        sync.setPackage(packageName)
+        sendBroadcast(sync)
 
-        if (!accessibilityOn()) {
-            Toast.makeText(this, getString(R.string.msg_need_accessibility), Toast.LENGTH_LONG).show()
-            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        if (start) {
+            if (!accessibilityOn()) {
+                Toast.makeText(this, getString(R.string.msg_need_accessibility), Toast.LENGTH_LONG).show()
+                try {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                } catch (e: Exception) { }
+            } else {
+                Toast.makeText(this, getString(R.string.msg_ready), Toast.LENGTH_LONG).show()
+            }
         } else {
-            Toast.makeText(this, getString(R.string.msg_ready), Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.msg_stopped), Toast.LENGTH_SHORT).show()
         }
-        isTranslating = true
         updateUI()
-    }
-
-    private fun disableFlow() {
-        getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
-            .putBoolean("uiOff", true).apply()
-        Toast.makeText(this, getString(R.string.msg_stopped), Toast.LENGTH_SHORT).show()
-        isTranslating = false
-        updateUI()
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == 1002 && Settings.canDrawOverlays(this)) {
-            enableFlow()
-        }
     }
 
     private fun updateUI() {
-        if (isTranslating) {
-            btnStart.text = getString(R.string.stop_translation)
-            tvStatus.text = getString(R.string.status_translating)
+        val running = isRunning()
+        if (running) {
+            btnStart?.text = getString(R.string.stop_translation)
+            tvStatus?.text = getString(R.string.status_translating)
         } else {
-            btnStart.text = getString(R.string.start_translation)
-            tvStatus.text = getString(R.string.status_idle)
+            btnStart?.text = getString(R.string.start_translation)
+            tvStatus?.text = getString(R.string.status_idle)
         }
-        updateComboText()
-    }
 
-    private fun updateComboText() {
-        val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
-        val currentKey = prefs.getString("currentKey", "None") ?: "None"
-        val currentModel = prefs.getString("currentModel", "None") ?: "None"
-        val lastError = prefs.getString("lastError", "") ?: ""
-        tvCurrentKey.text = "Key: " + currentKey
-        tvCurrentModel.text = "Model: " + currentModel
+        val p = prefs()
+        val currentKey = p.getString("currentKey", "None") ?: "None"
+        val currentModel = p.getString("currentModel", "None") ?: "None"
+        val lastError = p.getString("lastError", "") ?: ""
+        tvCurrentKey?.text = "Key: " + currentKey
+        tvCurrentModel?.text = "Model: " + currentModel
         if (lastError.isNotBlank()) {
-            tvStatus.text = lastError
+            tvStatus?.text = lastError
         }
     }
 
