@@ -3,7 +3,6 @@ package com.example.screentranslator
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
-import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -19,7 +18,6 @@ class MainActivity : Activity() {
     private lateinit var tvCurrentModel: TextView
     private lateinit var btnStart: Button
     private lateinit var btnSettings: Button
-    private lateinit var mediaProjectionManager: MediaProjectionManager
     private var isTranslating = false
 
     private val pollHandler = Handler(Looper.getMainLooper())
@@ -40,13 +38,11 @@ class MainActivity : Activity() {
         btnStart = findViewById(R.id.btnStart)
         btnSettings = findViewById(R.id.btnSettings)
 
-        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-
         btnStart.setOnClickListener {
             if (!isTranslating) {
-                checkPermissionsAndStart()
+                enableFlow()
             } else {
-                stopTranslation()
+                disableFlow()
             }
         }
 
@@ -57,72 +53,51 @@ class MainActivity : Activity() {
         updateUI()
     }
 
-    private fun checkPermissionsAndStart() {
+    private fun accessibilityOn(): Boolean {
+        val enabled = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: ""
+        return enabled.contains("TranslatorAccessibilityService")
+    }
+
+    private fun enableFlow() {
         if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "অনুগ্রহ করে ওভারলে পারমিশন দিন", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "ওভারলে পারমিশন দিন", Toast.LENGTH_LONG).show()
             val intent = Intent(
                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:" + packageName)
             )
-            startActivityForResult(intent, OVERLAY_PERMISSION_REQUEST)
+            startActivityForResult(intent, 1002)
             return
         }
 
-        val intent = mediaProjectionManager.createScreenCaptureIntent()
-        startActivityForResult(intent, SCREEN_CAPTURE_REQUEST)
-    }
+        getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("uiOff", false).apply()
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-
-        when (requestCode) {
-            SCREEN_CAPTURE_REQUEST -> {
-                if (resultCode == Activity.RESULT_OK && data != null) {
-                    startTranslation(resultCode, data)
-                } else {
-                    Toast.makeText(this, "স্ক্রিন ক্যাপচার বাতিল হয়েছে", Toast.LENGTH_SHORT).show()
-                }
-            }
-            OVERLAY_PERMISSION_REQUEST -> {
-                if (Settings.canDrawOverlays(this)) {
-                    checkPermissionsAndStart()
-                }
-            }
+        if (!accessibilityOn()) {
+            Toast.makeText(this, "তালিকা থেকে Screen Translator খুঁজে On করুন", Toast.LENGTH_LONG).show()
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        } else {
+            Toast.makeText(this, "ফ্লোটিং বাটন এসেছে! যে কোনো অ্যাপে গিয়ে চাপ দিন", Toast.LENGTH_LONG).show()
         }
-    }
-
-    private fun startTranslation(resultCode: Int, data: Intent) {
-        val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
-        val keys = listOf(
-            prefs.getString("key1", "") ?: "",
-            prefs.getString("key2", "") ?: "",
-            prefs.getString("key3", "") ?: "",
-            prefs.getString("key4", "") ?: "",
-            prefs.getString("key5", "") ?: ""
-        ).filter { it.isNotBlank() }
-
-        if (keys.isEmpty()) {
-            Toast.makeText(this, "অনুগ্রহ করে সেটিংসে অন্তত একটি API key দিন", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        val serviceIntent = Intent(this, TranslationService::class.java).apply {
-            action = "START_TRANSLATION"
-            putExtra("resultCode", resultCode)
-            putExtra("data", data)
-        }
-        startForegroundService(serviceIntent)
         isTranslating = true
         updateUI()
     }
 
-    private fun stopTranslation() {
-        val serviceIntent = Intent(this, TranslationService::class.java).apply {
-            action = "STOP_TRANSLATION"
-        }
-        startService(serviceIntent)
+    private fun disableFlow() {
+        getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("uiOff", true).apply()
+        Toast.makeText(this, "বন্ধ হয়েছে। আবার চালু করতে শুরু বাটনে চাপুন", Toast.LENGTH_SHORT).show()
         isTranslating = false
         updateUI()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 1002 && Settings.canDrawOverlays(this)) {
+            enableFlow()
+        }
     }
 
     private fun updateUI() {
@@ -140,24 +115,22 @@ class MainActivity : Activity() {
         val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
         val currentKey = prefs.getString("currentKey", "None") ?: "None"
         val currentModel = prefs.getString("currentModel", "None") ?: "None"
+        val lastError = prefs.getString("lastError", "") ?: ""
         tvCurrentKey.text = "Key: " + currentKey
         tvCurrentModel.text = "Model: " + currentModel
+        if (lastError.isNotBlank()) {
+            tvStatus.text = lastError
+        }
     }
 
     override fun onResume() {
         super.onResume()
         pollHandler.removeCallbacks(pollRunnable)
         pollHandler.post(pollRunnable)
-        updateUI()
     }
 
     override fun onPause() {
         super.onPause()
         pollHandler.removeCallbacks(pollRunnable)
-    }
-
-    companion object {
-        private const val SCREEN_CAPTURE_REQUEST = 1001
-        private const val OVERLAY_PERMISSION_REQUEST = 1002
     }
 }
