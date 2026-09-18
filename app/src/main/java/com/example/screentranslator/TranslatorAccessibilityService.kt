@@ -33,7 +33,7 @@ class OverlayView : View {
     data class Entry(val text: String, val orig: String, val rect: Rect)
 
     private var entries: List<Entry> = emptyList()
-    private val bgPaint = Paint().apply { color = Color.argb(235, 20, 20, 20) }
+    private val bgPaint = Paint().apply { color = Color.argb(255, 25, 25, 25) }
     private val textPaint = Paint().apply {
         color = Color.WHITE
         isAntiAlias = true
@@ -60,11 +60,13 @@ class OverlayView : View {
             resolved = true
         }
         val cap = 20f * resources.displayMetrics.density
+        val padX = 5f * resources.displayMetrics.density
+        val padY = 4f * resources.displayMetrics.density
         for (en in entries) {
-            val l = en.rect.left.toFloat() - offX - 2f
-            val t = en.rect.top.toFloat() - offY - 2f
-            val r = en.rect.right.toFloat() - offX + 2f
-            val b = en.rect.bottom.toFloat() - offY + 2f
+            val l = en.rect.left.toFloat() - offX - padX
+            val t = en.rect.top.toFloat() - offY - padY
+            val r = en.rect.right.toFloat() - offX + padX
+            val b = en.rect.bottom.toFloat() - offY + padY
             val w = r - l
             val h = b - t
             if (w <= 0 || h <= 0) continue
@@ -87,16 +89,37 @@ class OverlayView : View {
 
             val totalH = lines.size * textPaint.textSize * 1.25f
             var y = t + (h - totalH) / 2f + textPaint.textSize
+
+            canvas.save()
+            canvas.clipRect(l, t, r, b)
             for (line in lines) {
                 canvas.drawText(line, l + 4f, y, textPaint)
                 y += textPaint.textSize * 1.25f
             }
+            canvas.restore()
         }
     }
 
     private fun wrap(text: String, paint: Paint, maxWidth: Float): List<String> {
         if (maxWidth <= 0) return listOf(text)
-        val words = text.split(' ')
+        val words = ArrayList<String>()
+        for (raw in text.split(' ')) {
+            if (raw.isEmpty()) continue
+            if (paint.measureText(raw) <= maxWidth) {
+                words.add(raw)
+            } else {
+                val chunk = StringBuilder()
+                for (ch in raw) {
+                    val test = chunk.toString() + ch
+                    if (paint.measureText(test) > maxWidth && chunk.isNotEmpty()) {
+                        words.add(chunk.toString())
+                        chunk.clear()
+                    }
+                    chunk.append(ch)
+                }
+                if (chunk.isNotEmpty()) words.add(chunk.toString())
+            }
+        }
         val lines = ArrayList<String>()
         val current = StringBuilder()
         for (w in words) {
@@ -460,9 +483,15 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun buildPrompt(items: List<Item>): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("তুমি একজন দক্ষ অনুবাদক। নিচে বিভিন্ন ভাষার লেখা দেওয়া আছে (ইংরেজি, চাইনিজ, উইঘুর বা অন্য যেকোনো ভাষা হতে পারে)। ")
-        sb.append("প্রতিটি লাইনকে অত্যন্ত সাবলীল, প্রাঞ্জল ও স্বাভাবিক বাংলায় অনুবাদ করো, যেন মনে হয় বাংলাতেই লেখা হয়েছিল। ")
-        sb.append("অর্থ যেন বিকৃত না হয়। লাইনে শুধু সংখ্যা বা কোড থাকলে সেটি হুবহু রেখে দিও। আগে থেকে বাংলায় থাকলে হুবহু রেখে দিও। ")
+        sb.append("তুমি একজন দক্ষ অনুবাদক। নিচে বিভিন্ন ভাষার লেখা দেওয়া আছে। ")
+        sb.append("প্রতিটি লাইন কোন ভাষায় লেখা তা আগে চেনো: ইংরেজি, চাইনিজ, উইঘুর, বাংলা বা অন্য কিছু। ")
+        sb.append("উইঘুর ভাষা আরবি লিপিতে ডান-থেকে-বাম লেখা হয়; এমন লেখা পেলে সঠিকভাবে চিনে তার পুরো অর্থ প্রাঞ্জল বাংলায় দিও। ")
+        sb.append("প্রতিটি লাইনকে অত্যন্ত সাবলীল, প্রাঞ্জল ও সঠিক বাংলায় অনুবাদ করো, যেন মনে হয় বাংলাতেই লেখা হয়েছিল। ")
+        sb.append("অর্থ একদম ঠিক রাখবে; কিছু যোগ করবে না, কিছু বাদ দেবে না। ")
+        sb.append("লেখা কাটা বা অসম্পূর্ণ থাকলে যেটুকু আছে ঠিক সেটুকুর অর্থই বাংলায় দিও। ")
+        sb.append("ইমোজি, স্মাইলি, প্রতীক, সংখ্যা, লিংক, ইউজারনেম হুবহু রেখে দিও, অনুবাদ করবে না। ")
+        sb.append("লাইনে শুধু ইমোজি বা প্রতীক থাকলে সেই লাইন হুবহু ফেরত দিও। ")
+        sb.append("আগে থেকে বাংলায় থাকলে হুবহু রেখে দিও। ")
         sb.append("উত্তর হবে valid JSON: translations নামে array, প্রতিটি entry তে id এবং translated_text। ")
         sb.append("একটি id-ও বাদ দেবে না, ক্রম একই থাকবে। লাইনগুলো:")
         sb.append(nl)
