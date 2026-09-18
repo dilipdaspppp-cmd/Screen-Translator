@@ -445,6 +445,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val t = node.text?.toString()
             if (t != null) {
                 var clean = t.replace(CHAR_NL, ' ').replace(CHAR_CR, ' ').trim()
+                clean = stripEmojiTags(clean)
                 if (clean.length > 1 && node.isVisibleToUser && hasTranslatable(clean)) {
                     if (clean.length > 700) clean = clean.substring(0, 700)
                     val r = Rect()
@@ -461,6 +462,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 if (child != null) walk(child, items, depth + 1)
             }
         } catch (e: Exception) { }
+    }
+
+    private fun stripEmojiTags(s: String): String {
+        // ইমোজির বর্গ-বন্ধনী বর্ণনা যেমন [玫瑰], [捂脸] বাদ দেওয়া হচ্ছে —
+        // এগুলো অনুবাদের তালিকায় কখনোই ঢুকবে না, স্ক্রিনেও দেখানো হবে না।
+        var out = EMOJI_TAG_REGEX.replace(s, "")
+        out = MULTI_SPACE_REGEX.replace(out, " ").trim()
+        return out
     }
 
     private fun hasTranslatable(s: String): Boolean {
@@ -834,7 +843,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
         sb.append("4) নাম, ব্র্যান্ড, সংখ্যা, সময়, মডেল, লিংক, কোড অপরিবর্তিত রাখো।").append(nl)
         sb.append("5) কোনো ব্যাখ্যা, নোট বা অতিরিক্ত লেখা দেবে না।").append(nl)
         sb.append("6) লেখা ইতিমধ্যে বাংলা হলে হুবহু ফিরত দাও।").append(nl)
-        sb.append("7) বাংলা অনুবাদ যেন স্বাভাবিক ও প্রাঞ্জল হয়, শব্দে শব্দে নয়; যেকোনো ভাষা থেকে বাংলায় অনুবাদ করবে।").append(nl)
+        sb.append("7) প্রতিটি অনুবাদ অবশ্যই একটাই স্বাভাবিক, প্রবাহমান বাংলা বাক্য/বাক্যাংশ হতে হবে — কমা দিয়ে দিয়ে শব্দ বা টুকরো টুকরো অংশ সাজিয়ে একটা তালিকার মতো দেবে না।").append(nl)
+        sb.append("8) শব্দ ধরে ধরে আক্ষরিক (word-by-word/gloss) অনুবাদ করবে না; পুরো লাইনটার সামগ্রিক অর্থ আগে বোঝো, তারপর সেটাকে শুদ্ধ ও সহজ বাংলায় নতুন করে লেখো। উইঘুর, আরবি বা অন্য যেকোনো ভাষার জন্যও এই একই নিয়ম প্রযোজ্য।").append(nl)
+        sb.append("9) কোনো লাইনের ভেতরে বর্গ বন্ধনীর ভেতরে চিহ্ন/অক্ষর থাকলে (যেমন [xx]) সেটা উপেক্ষা করবে, অনুবাদ করবে না, আউটপুটেও রাখবে না।").append(nl)
         sb.append("শুধু এই JSON ফরম্যাটে উত্তর দাও: {translations:[{id:1,translated_text:বাংলা}]}").append(nl)
         sb.append("লাইনের তালিকা:").append(nl)
         for (i in chunk.indices) {
@@ -1216,6 +1227,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
     companion object {
         private val CHAR_NL = Char(10)
         private val CHAR_CR = Char(13)
+        private val EMOJI_TAG_REGEX = Regex("\\[[^\\[\\]]{1,24}\\]")
+        private val MULTI_SPACE_REGEX = Regex("\\s{2,}")
         private const val MAX_NODES = 400
         private const val MAX_ITEMS = 100
         private const val CHUNK = 30
