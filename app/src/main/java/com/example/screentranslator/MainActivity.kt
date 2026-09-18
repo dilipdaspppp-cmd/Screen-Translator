@@ -56,7 +56,7 @@ class MainActivity : Activity() {
             getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
                 .putBoolean("uiOff", true).apply()
             sendBroadcast(Intent("com.example.screentranslator.EXIT"))
-            Toast.makeText(this, "সম্পূর্ণ বন্ধ হয়েছে। ব্যাটারি খরচ হবে না।", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.msg_exit), Toast.LENGTH_LONG).show()
             finish()
         }
 
@@ -73,7 +73,7 @@ class MainActivity : Activity() {
 
     private fun enableFlow() {
         if (!Settings.canDrawOverlays(this)) {
-            Toast.makeText(this, "ওভারলে পারমিশন দিন", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.msg_need_overlay), Toast.LENGTH_LONG).show()
             val intent = Intent(
                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                 Uri.parse("package:" + packageName)
@@ -86,10 +86,10 @@ class MainActivity : Activity() {
             .putBoolean("uiOff", false).apply()
 
         if (!accessibilityOn()) {
-            Toast.makeText(this, "তালিকা থেকে Screen Translator খুঁজে On করুন", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.msg_need_accessibility), Toast.LENGTH_LONG).show()
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         } else {
-            Toast.makeText(this, "ফ্লোটিং বাটন এসেছে! যে কোনো অ্যাপে গিয়ে চাপ দিন", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.msg_ready), Toast.LENGTH_LONG).show()
         }
         isTranslating = true
         updateUI()
@@ -98,7 +98,7 @@ class MainActivity : Activity() {
     private fun disableFlow() {
         getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
             .putBoolean("uiOff", true).apply()
-        Toast.makeText(this, "লুকানো হয়েছে। আবার চালু করতে শুরু বাটনে চাপুন", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, getString(R.string.msg_stopped), Toast.LENGTH_SHORT).show()
         isTranslating = false
         updateUI()
     }
