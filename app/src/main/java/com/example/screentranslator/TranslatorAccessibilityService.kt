@@ -41,28 +41,17 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.TimeUnit
 
 class OverlayView(context: Context) : View(context) {
-
-    class Entry(val text: String, val rect: Rect, val srcSize: Float)
-
+    class Entry(val text: String, val rect: Rect, val srcSize: Float, val maxLines: Int)
     private class Drawn(val rect: Rect, val layout: StaticLayout, val pad: Float, val area: Long)
-
     private var drawn: List<Drawn> = emptyList()
-
     private val bgPaint = Paint().apply {
         color = Color.rgb(18, 18, 18)
         isAntiAlias = false
     }
 
-    private val textPaint = TextPaint().apply {
-        color = Color.WHITE
-        isAntiAlias = true
-    }
-
     fun setEntries(list: List<Entry>) {
         val density = resources.displayMetrics.density
         val pad = 2f * density
-        val minSize = 9f * density
-        val hardMax = 26f * density
         val out = ArrayList<Drawn>()
         for (en in list) {
             val w = en.rect.width()
@@ -70,76 +59,42 @@ class OverlayView(context: Context) : View(context) {
             if (w <= 2 || h <= 2) continue
             val innerW = (w - pad * 2f).toInt()
             if (innerW <= 4) continue
-            val innerH = h.toFloat() - 1f
-            if (innerH <= 2f) continue
-            var maxSize = en.srcSize
-            if (maxSize < minSize) maxSize = minSize
-            if (maxSize > hardMax) maxSize = hardMax
-            val layout = fit(en.text, innerW, innerH, maxSize, minSize)
+            val paint = TextPaint()
+            paint.color = Color.WHITE
+            paint.isAntiAlias = true
+            paint.textSize = en.srcSize
+            val align = if (en.text.length <= 28) Layout.Alignment.ALIGN_CENTER else Layout.Alignment.ALIGN_NORMAL
+            val builder = StaticLayout.Builder.obtain(en.text, 0, en.text.length, paint, innerW)
+                .setAlignment(align)
+                .setLineSpacing(0f, 1f)
+                .setIncludePad(false)
+            if (en.maxLines > 0) {
+                builder.setMaxLines(en.maxLines)
+                builder.setEllipsize(TextUtils.TruncateAt.END)
+            }
+            val layout = builder.build()
             out.add(Drawn(Rect(en.rect), layout, pad, w.toLong() * h.toLong()))
         }
         drawn = out.sortedByDescending { it.area }
         invalidate()
     }
 
-    private fun fit(text: String, width: Int, height: Float, maxSize: Float, minSize: Float): StaticLayout {
-        var size = maxSize
-        if (size < minSize) size = minSize
-        var layout = build(text, width, size, 0)
-        var guard = 0
-        while (layout.height > height && size > minSize && guard < 140) {
-            size = size - 0.5f
-            if (size < minSize) size = minSize
-            layout = build(text, width, size, 0)
-            guard++
-        }
-        if (layout.height > height) {
-            textPaint.textSize = minSize
-            val fm = textPaint.fontMetrics
-            var lineH = fm.descent - fm.ascent
-            if (lineH < 1f) lineH = 1f
-            var maxLines = (height / lineH).toInt()
-            if (maxLines < 1) maxLines = 1
-            layout = build(text, width, minSize, maxLines)
-        }
-        return layout
-    }
-
-    private fun build(text: String, width: Int, size: Float, maxLines: Int): StaticLayout {
-        textPaint.textSize = size
-        val align = if (text.length <= 28) Layout.Alignment.ALIGN_CENTER else Layout.Alignment.ALIGN_NORMAL
-        val builder = StaticLayout.Builder.obtain(text, 0, text.length, textPaint, width)
-            .setAlignment(align)
-            .setLineSpacing(0f, 1f)
-            .setIncludePad(false)
-        if (maxLines > 0) {
-            builder.setMaxLines(maxLines)
-            builder.setEllipsize(TextUtils.TruncateAt.END)
-        }
-        return builder.build()
-    }
-
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (drawn.isEmpty()) return
-
         val loc = IntArray(2)
         getLocationOnScreen(loc)
         val offX = loc[0]
         val offY = loc[1]
-
         for (d in drawn) {
             val l = (d.rect.left - offX).toFloat()
             val t = (d.rect.top - offY).toFloat()
             val r = (d.rect.right - offX).toFloat()
             val b = (d.rect.bottom - offY).toFloat()
             if (r <= l || b <= t) continue
-
             canvas.drawRect(l, t, r, b, bgPaint)
-
             var dy = t + ((b - t) - d.layout.height) / 2f
             if (dy < t) dy = t
-
             canvas.save()
             canvas.clipRect(l, t, r, b)
             canvas.translate(l + d.pad, dy)
@@ -150,19 +105,14 @@ class OverlayView(context: Context) : View(context) {
 }
 
 class TranslatorAccessibilityService : AccessibilityService() {
-
-    private class Item(val text: String, val rect: Rect, val srcSize: Float, val fromImage: Boolean, val id: Int)
-
+    private class Item(val text: String, val rect: Rect, val srcSize: Float, val fromImage: Boolean, val id: Int, val maxLines: Int = BOX_MAX_LINES)
     private var overlayView: OverlayView? = null
     private var buttonView: TextView? = null
     private var buttonBg: GradientDrawable? = null
     private var buttonParams: WindowManager.LayoutParams? = null
     private var windowManager: WindowManager? = null
     private val handler = Handler(Looper.getMainLooper())
-
     private val measurePaint = TextPaint()
-    private val fitPaint = TextPaint()
-
     private var currentKeyIndex = 0
     private var currentModelIndex = 0
     private var screenWidth = 1
@@ -174,16 +124,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var minBoxHeight = 1
     private var minBoxWidth = 1
     private var uiReady = false
-
     private var receiver: BroadcastReceiver? = null
-
     private val longPressRunnable = Runnable {
         getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
             .putBoolean("uiOff", true).apply()
         syncUiState()
         toast(getString(R.string.msg_button_hidden))
     }
-
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
@@ -342,7 +289,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
             gravity = Gravity.CENTER
             background = buttonBg
         }
-
         buttonSize = dpToPx(46)
         buttonParams = WindowManager.LayoutParams(
             buttonSize, buttonSize,
@@ -354,7 +300,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         buttonParams?.gravity = Gravity.TOP or Gravity.START
         buttonParams?.x = dpToPx(8)
         buttonParams?.y = screenHeight / 2
-
         attachButtonTouch()
         windowManager?.addView(buttonView, buttonParams)
     }
@@ -445,20 +390,17 @@ class TranslatorAccessibilityService : AccessibilityService() {
         try {
             root = rootInActiveWindow
         } catch (e: Exception) { }
-
         if (root != null && root.packageName?.toString() == packageName) {
             resetWork()
             toast(getString(R.string.msg_own_app))
             return
         }
-
         val raw = ArrayList<Item>()
         if (root != null) {
             try {
                 walk(root, raw, 0)
             } catch (e: Exception) { }
         }
-
         val cleaned = dedupe(filterParents(raw))
         val limited = if (cleaned.size > MAX_ITEMS) cleaned.subList(0, MAX_ITEMS) else cleaned
         val items = ArrayList<Item>()
@@ -466,7 +408,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val s = limited[i]
             items.add(Item(s.text, Rect(s.rect), s.srcSize, false, i + 1))
         }
-
         captureScreen { shot ->
             if (items.isEmpty() && shot == null) {
                 resetWork()
@@ -590,21 +531,75 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return ((inter * 100L) / area).toInt()
     }
 
-    private fun layoutRects(list: List<Item>): MutableList<Item> {
-        val sorted = list.sortedWith(Comparator { a, b ->
-            val areaA = a.rect.width().toLong() * a.rect.height().toLong()
-            val areaB = b.rect.width().toLong() * b.rect.height().toLong()
-            if (areaA < areaB) -1 else if (areaA > areaB) 1 else 0
-        })
+    private fun estHeight(text: String, innerW: Int, size: Float): Pair<Int, Float> {
+        measurePaint.textSize = size
+        val total = measurePaint.measureText(text)
+        val fm = measurePaint.fontMetrics
+        var lineH = fm.descent - fm.ascent
+        if (lineH < 1f) lineH = 1f
+        val w = if (innerW < 4) 4 else innerW
+        var lines = Math.ceil((total / w).toDouble()).toInt()
+        if (lines < 1) lines = 1
+        return Pair((lines * lineH).toInt(), lineH)
+    }
 
+    private fun layoutBoxes(list: List<Item>): List<Item> {
+        val d = resources.displayMetrics.density
+        val padSide = Math.max(2, (2f * d).toInt())
+        val gap = Math.max(2, (2f * d).toInt())
+        val margin = Math.max(2, (3f * d).toInt())
+        val minSize = 9f * d
+        val hardMax = 26f * d
+        val maxW = screenWidth - margin * 2
+        val minW = dpToPx(60)
+        val sorted = list.sortedWith(Comparator { a, b ->
+            if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
+        })
         val placed = ArrayList<Item>()
         for (cand in sorted) {
-            val orig = Rect(cand.rect)
-            val r = Rect(orig)
-            var ok = true
+            var size = cand.srcSize
+            if (size < minSize) size = minSize
+            if (size > hardMax) size = hardMax
+            val orig = cand.rect
+            var width = orig.width()
+            if (width < minW) width = minW
+            if (width > maxW) width = maxW
+            var res = estHeight(cand.text, width - padSide * 2, size)
+            var lineH = res.second
+            var allowH = Math.max(orig.height() + (4f * d).toInt(), (lineH * 2f).toInt() + padSide * 2)
+            if (res.first + padSide * 2 > allowH && width < maxW) {
+                width = maxW
+                res = estHeight(cand.text, width - padSide * 2, size)
+                lineH = res.second
+            }
             var guard = 0
-            while (guard < 60) {
+            while (res.first + padSide * 2 > allowH && size > minSize && guard < 40) {
+                size = size - 1f
+                if (size < minSize) size = minSize
+                res = estHeight(cand.text, width - padSide * 2, size)
+                lineH = res.second
                 guard++
+            }
+            val capH = (lineH * BOX_MAX_LINES.toFloat()).toInt()
+            var boxH = res.first
+            if (boxH > capH) boxH = capH
+            boxH = boxH + padSide * 2
+            measurePaint.textSize = size
+            val singleW = Math.ceil(measurePaint.measureText(cand.text).toDouble()).toInt() + padSide * 2
+            var boxW = if (singleW <= width) singleW else width
+            if (boxW < minBoxWidth) boxW = minBoxWidth
+            if (boxW > maxW) boxW = maxW
+            var left = orig.left
+            if (left + boxW > screenWidth - margin) left = orig.right - boxW
+            if (left + boxW > screenWidth - margin) left = screenWidth - margin - boxW
+            if (left < margin) left = margin
+            var top = orig.top + (orig.height() - boxH) / 2
+            if (top + boxH > screenHeight - margin) top = screenHeight - margin - boxH
+            if (top < margin) top = margin
+            val r = Rect(left, top, left + boxW, top + boxH)
+            var guard2 = 0
+            while (guard2 < 80) {
+                guard2++
                 var hit: Rect? = null
                 for (p in placed) {
                     if (Rect.intersects(r, p.rect)) {
@@ -613,87 +608,17 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     }
                 }
                 if (hit == null) break
-
-                val ox = Math.min(r.right, hit.right) - Math.max(r.left, hit.left)
-                val oy = Math.min(r.bottom, hit.bottom) - Math.max(r.top, hit.top)
-                if (oy <= ox) {
-                    if (r.centerY() >= hit.centerY()) r.top = hit.bottom else r.bottom = hit.top
-                } else {
-                    if (r.centerX() >= hit.centerX()) r.left = hit.right else r.right = hit.left
-                }
-                if (r.width() < minBoxWidth || r.height() < minBoxHeight) {
-                    ok = false
+                r.top = hit.bottom + gap
+                r.bottom = r.top + boxH
+                if (r.bottom > screenHeight - margin) {
+                    r.bottom = screenHeight - margin
+                    r.top = r.bottom - boxH
                     break
                 }
             }
-            if (ok) {
-                for (p in placed) {
-                    if (Rect.intersects(r, p.rect)) {
-                        ok = false
-                        break
-                    }
-                }
-            }
-            val keptArea = r.width().toLong() * r.height().toLong()
-            val origArea = orig.width().toLong() * orig.height().toLong()
-            if (ok && keptArea * 100L >= origArea * 45L) {
-                placed.add(Item(cand.text, r, cand.srcSize, cand.fromImage, cand.id))
-            } else {
-                placed.add(Item(cand.text, orig, cand.srcSize, cand.fromImage, cand.id))
-            }
+            placed.add(Item(cand.text, r, size, cand.fromImage, cand.id, BOX_MAX_LINES))
         }
         return placed
-    }
-
-    private fun needsRoom(item: Item): Boolean {
-        fitPaint.textSize = if (item.srcSize > 1f) item.srcSize else 12f
-        val total = fitPaint.measureText(item.text)
-        val fm = fitPaint.fontMetrics
-        var lineH = fm.descent - fm.ascent
-        if (lineH < 1f) lineH = 1f
-        val w = (item.rect.width() - 4).toFloat()
-        if (w < 4f) return true
-        var lines = Math.ceil((total / w).toDouble()).toInt()
-        if (lines < 1) lines = 1
-        return lines.toFloat() * lineH > item.rect.height().toFloat()
-    }
-
-    private fun collides(r: Rect, list: List<Item>, skip: Int): Boolean {
-        for (i in list.indices) {
-            if (i == skip) continue
-            if (Rect.intersects(r, list[i].rect)) return true
-        }
-        return false
-    }
-
-    private fun grow(placed: MutableList<Item>) {
-        val screen = Rect(0, 0, screenWidth, screenHeight)
-        for (i in placed.indices) {
-            val item = placed[i]
-            if (!needsRoom(item)) continue
-            val r = item.rect
-            val maxExtraW = (r.width() * 0.7f).toInt()
-            var extra = 0
-            while (extra < maxExtraW) {
-                val test = Rect(r.left, r.top, r.right + 8, r.bottom)
-                if (!screen.contains(test)) break
-                if (collides(test, placed, i)) break
-                r.right = test.right
-                extra += 8
-                if (!needsRoom(item)) break
-            }
-            if (!needsRoom(item)) continue
-            val maxExtraH = (r.height() * 0.8f).toInt()
-            extra = 0
-            while (extra < maxExtraH) {
-                val test = Rect(r.left, r.top, r.right, r.bottom + 6)
-                if (!screen.contains(test)) break
-                if (collides(test, placed, i)) break
-                r.bottom = test.bottom
-                extra += 6
-                if (!needsRoom(item)) break
-            }
-        }
     }
 
     private fun captureScreen(done: (String?) -> Unit) {
@@ -799,10 +724,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 }
                 return
             }
-
             val map = HashMap<Int, String>()
             var lastCode = 0
-
             if (items.isNotEmpty()) {
                 var i = 0
                 while (i < items.size) {
@@ -826,12 +749,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     }
                 }
             }
-
             val imageItems = ArrayList<Item>()
             if (shot != null) {
                 imageItems.addAll(translateShot(shot, items, keys, models))
             }
-
             val entries = ArrayList<Item>()
             for (it0 in items) {
                 val tr = map[it0.id] ?: continue
@@ -854,7 +775,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     extraId++
                 }
             }
-
             if (entries.isEmpty()) {
                 if (lastCode != 0 && lastCode != 200) {
                     saveError("HTTP " + lastCode)
@@ -871,11 +791,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 }
                 return
             }
-
-            val laid = layoutRects(entries)
-            grow(laid)
+            val laid = layoutBoxes(entries)
             val drawList = ArrayList<OverlayView.Entry>()
-            for (e in laid) drawList.add(OverlayView.Entry(e.text, e.rect, e.srcSize))
+            for (e in laid) drawList.add(OverlayView.Entry(e.text, e.rect, e.srcSize, e.maxLines))
             saveError("")
             handler.post { showOverlay(drawList) }
         } catch (e: Exception) {
@@ -918,16 +836,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun buildPrompt(chunk: List<Item>): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("তুমি একজন পেশাদার অনুবাদক। নিচের নম্বর দেওয়া প্রতিটি লেখা সহজ বাংলায় অনুবাদ করো।").append(nl)
+        sb.append("তুমি একজন পেশাদার অনুবাদক। নিচের নম্বর দেওয়া প্রতিটি লাইনের বাংলা অনুবাদ দাও।").append(nl)
         sb.append("নিয়ম:").append(nl)
-        sb.append("1) তালিকার প্রতিটি নম্বরের জন্য অবশ্যই একটি করে ফলাফল দিতে হবে, একটিও বাদ দেওয়া যাবে না।").append(nl)
+        sb.append("1) তালিকার প্রতিটি নম্বরের জন্য অবশ্যই একটি ফলাফল দিতে হবে, কিছু বাদ দেওয়া যাবে না।").append(nl)
         sb.append("2) মোট ").append(chunk.size).append(" টি আইটেম আছে, তাই ঠিক ").append(chunk.size).append(" টি ফলাফল দাও।").append(nl)
-        sb.append("3) অনুবাদ যত সম্ভব ছোট রাখো, মূল লেখার চেয়ে অনেক বড় করবে না।").append(nl)
-        sb.append("4) নাম, ব্র্যান্ড, সংখ্যা, সময়, ইমেইল, লিংক, কোড অপরিবর্তিত রাখো।").append(nl)
+        sb.append("3) অনুবাদ যত সম্ভব ছোট রাখো, মূল লাইনের চেয়ে অনেক বড় করবে না।").append(nl)
+        sb.append("4) নাম, ব্র্যান্ড, সংখ্যা, সময়, মডেল, লিংক, কোড অপরিবর্তিত রাখো।").append(nl)
         sb.append("5) কোনো ব্যাখ্যা, নোট বা অতিরিক্ত লেখা দেবে না।").append(nl)
-        sb.append("6) লেখা আগে থেকেই বাংলা হলে হুবহু সেটাই ফেরত দাও।").append(nl)
+        sb.append("6) লেখা ইতিমধ্যে বাংলা হলে হুবহু ফিরত দাও।").append(nl)
         sb.append("শুধু এই JSON ফরম্যাটে উত্তর দাও: {translations:[{id:1,translated_text:বাংলা}]}").append(nl)
-        sb.append("লেখার তালিকা:").append(nl)
+        sb.append("লাইনের তালিকা:").append(nl)
         for (i in chunk.indices) {
             sb.append(i + 1).append(". ").append(chunk[i].text).append(nl)
         }
@@ -939,16 +857,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val sb = StringBuilder()
         sb.append("এটি একটি মোবাইল স্ক্রিনের ছবি। ছবিটি ভালোভাবে দেখো।").append(nl)
         if (full) {
-            sb.append("ছবিতে যত লেখা দেখা যাচ্ছে সব খুঁজে বের করে বাংলায় অনুবাদ করো।").append(nl)
+            sb.append("ছবিতে যত লেখা দেখা যায়, সব লেখার বাংলা অনুবাদ দাও।").append(nl)
         } else {
-            sb.append("শুধু সেই লেখাগুলো খুঁজে বের করো যেগুলো ছবি, পোস্টার, লোগো, থাম্বনেইল বা গ্রাফিক্সের ভেতরে আঁকা আছে, তারপর বাংলায় অনুবাদ করো।").append(nl)
+            sb.append("শুধু সেই লেখাগুলোর বাংলা দাও যেগুলো ছবি, পোস্টার, লোগো, থাম্বনেইল বা গ্রাফিক্সের ভেতরে আঁকা আছে।").append(nl)
         }
-        sb.append("প্রতিটি লেখার জন্য তার অবস্থান box_2d আকারে দাও, মান হবে [ymin,xmin,ymax,xmax] এবং 0 থেকে 1000 এর মধ্যে স্বাভাবিকীকৃত।").append(nl)
-        sb.append("বক্সটি শুধু ওই লেখাটুকু ঘিরে থাকবে, পুরো ছবি নয়।").append(nl)
-        sb.append("সর্বোচ্চ 22 টি আইটেম দাও। সংখ্যা, ঘড়ির সময়, ব্যাটারি বা সিগন্যাল আইকনের লেখা বাদ দাও।").append(nl)
+        sb.append("প্রতিটি লাইনের জন্য তার অবস্থান box_2d আকারে দাও, মান হবে [ymin,xmin,ymax,xmax] এবং 0 থেকে 1000 এর মধ্যে স্বাভাবিককৃত।").append(nl)
+        sb.append("বক্সটি শুধু লেখার চারপাশে থাকবে, পুরো ছবি নয়।").append(nl)
+        sb.append("সর্বোচ্চ 22 টি আইটেম দাও। সংখ্যা, ঘড়ির সময়, ব্যাটারি বা সিস্টেম আইকনের লেখা বাদ দাও।").append(nl)
         sb.append("কোনো ব্যাখ্যা দেবে না। শুধু এই JSON দাও: {items:[{translated_text:বাংলা,box_2d:[0,0,0,0]}]}").append(nl)
         if (known.isNotEmpty()) {
-            sb.append("নিচের লেখাগুলো আগেই অনুবাদ হয়ে গেছে, এগুলো আর দেবে না:").append(nl)
+            sb.append("নিচের লাইনগুলো ইতিমধ্যে অনুবাদ হয়েছে, এগুলো আবার দেবে না:").append(nl)
             var count = 0
             for (k in known) {
                 if (count >= 40) break
@@ -997,32 +915,25 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val textPart = JSONObject()
             textPart.put("text", prompt)
             parts.put(textPart)
-
             val content = JSONObject()
             content.put("role", "user")
-            content.put("parts", parts)
             val contents = JSONArray()
             contents.put(content)
-
             val gen = JSONObject()
             gen.put("temperature", 0.1)
             gen.put("maxOutputTokens", 8192)
             gen.put("responseMimeType", "application/json")
-
             val json = JSONObject()
             json.put("contents", contents)
             json.put("generationConfig", gen)
-
             val url = "https://generativelanguage.googleapis.com/v1beta/models/" +
                     model + ":generateContent?key=" + key
             val requestBody = json.toString().toRequestBody("application/json".toMediaType())
             val request = Request.Builder().url(url).post(requestBody).build()
-
             val response = client.newCall(request).execute()
             val code = response.code
             val body = response.body?.string()
             response.close()
-
             if (code == 200 && body != null) {
                 val jsonResponse = JSONObject(body)
                 val candidates = jsonResponse.optJSONArray("candidates")
@@ -1092,7 +1003,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             arr = null
         }
-
         if (arr != null) {
             for (i in 0 until arr.length()) {
                 val e = arr.opt(i)
@@ -1317,6 +1227,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val MAX_NODES = 400
         private const val MAX_ITEMS = 100
         private const val CHUNK = 30
+        private const val BOX_MAX_LINES = 3
         private const val COLOR_IDLE = "#2196F3"
         private const val COLOR_BUSY = "#FF9800"
         private const val COLOR_DONE = "#4CAF50"
