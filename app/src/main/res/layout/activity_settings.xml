@@ -13,7 +13,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="API Keys (5টি)"
+            android:text="@string/api_keys_title"
             android:textSize="20sp"
             android:textStyle="bold"
             android:layout_marginBottom="16dp" />
@@ -22,7 +22,7 @@
             android:id="@+id/etKey1"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Key 1"
+            android:hint="@string/hint_key_1"
             android:inputType="text"
             android:layout_marginBottom="8dp" />
 
@@ -30,7 +30,7 @@
             android:id="@+id/etKey2"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Key 2"
+            android:hint="@string/hint_key_2"
             android:inputType="text"
             android:layout_marginBottom="8dp" />
 
@@ -38,7 +38,7 @@
             android:id="@+id/etKey3"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Key 3"
+            android:hint="@string/hint_key_3"
             android:inputType="text"
             android:layout_marginBottom="8dp" />
 
@@ -46,7 +46,7 @@
             android:id="@+id/etKey4"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Key 4"
+            android:hint="@string/hint_key_4"
             android:inputType="text"
             android:layout_marginBottom="8dp" />
 
@@ -54,14 +54,14 @@
             android:id="@+id/etKey5"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Key 5"
+            android:hint="@string/hint_key_5"
             android:inputType="text"
             android:layout_marginBottom="24dp" />
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Models (On/Off)"
+            android:text="@string/models_title"
             android:textSize="20sp"
             android:textStyle="bold"
             android:layout_marginBottom="16dp" />
@@ -70,7 +70,7 @@
             android:id="@+id/cbModel1"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="gemini-3.5-flash-lite"
+            android:text="@string/model_1"
             android:checked="true"
             android:layout_marginBottom="8dp" />
 
@@ -78,7 +78,7 @@
             android:id="@+id/cbModel2"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="gemini-3.1-flash-lite"
+            android:text="@string/model_2"
             android:checked="true"
             android:layout_marginBottom="8dp" />
 
@@ -86,7 +86,7 @@
             android:id="@+id/cbModel3"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="gemini-3-flash-preview"
+            android:text="@string/model_3"
             android:checked="true"
             android:layout_marginBottom="24dp" />
 
@@ -94,7 +94,7 @@
             android:id="@+id/btnSave"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="সেভ করুন"
+            android:text="@string/save_text"
             android:textSize="18sp" />
 
     </LinearLayout>
