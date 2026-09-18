@@ -52,6 +52,7 @@ class OverlayView(context: Context) : View(context) {
     fun setEntries(list: List<Entry>) {
         val density = resources.displayMetrics.density
         val pad = 2f * density
+        val minSize = 9f * density
         val out = ArrayList<Drawn>()
         for (en in list) {
             val w = en.rect.width()
@@ -59,24 +60,44 @@ class OverlayView(context: Context) : View(context) {
             if (w <= 2 || h <= 2) continue
             val innerW = (w - pad * 2f).toInt()
             if (innerW <= 4) continue
+            val innerH = (h - pad * 2f).toInt()
+            if (innerH <= 2) continue
             val paint = TextPaint()
             paint.color = Color.WHITE
             paint.isAntiAlias = true
-            paint.textSize = en.srcSize
+            var size = en.srcSize
+            if (size < minSize) size = minSize
+            paint.textSize = size
             val align = if (en.text.length <= 28) Layout.Alignment.ALIGN_CENTER else Layout.Alignment.ALIGN_NORMAL
-            val builder = StaticLayout.Builder.obtain(en.text, 0, en.text.length, paint, innerW)
-                .setAlignment(align)
-                .setLineSpacing(0f, 1f)
-                .setIncludePad(false)
-            if (en.maxLines > 0) {
-                builder.setMaxLines(en.maxLines)
-                builder.setEllipsize(TextUtils.TruncateAt.END)
+            var layout = buildLayout(en.text, paint, innerW, align, 0)
+            var guard = 0
+            while (layout.height > innerH && size > minSize && guard < 60) {
+                size = size - 0.5f
+                if (size < minSize) size = minSize
+                paint.textSize = size
+                layout = buildLayout(en.text, paint, innerW, align, 0)
+                guard++
             }
-            val layout = builder.build()
+            if (layout.height > innerH && en.maxLines > 0) {
+                layout = buildLayout(en.text, paint, innerW, align, en.maxLines)
+            }
             out.add(Drawn(Rect(en.rect), layout, pad, w.toLong() * h.toLong()))
         }
         drawn = out.sortedByDescending { it.area }
         invalidate()
+    }
+
+    private fun buildLayout(text: String, paint: TextPaint, width: Int,
+                            align: Layout.Alignment, maxLines: Int): StaticLayout {
+        val builder = StaticLayout.Builder.obtain(text, 0, text.length, paint, width)
+            .setAlignment(align)
+            .setLineSpacing(0f, 1f)
+            .setIncludePad(false)
+        if (maxLines > 0) {
+            builder.setMaxLines(maxLines)
+            builder.setEllipsize(TextUtils.TruncateAt.END)
+        }
+        return builder.build()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -105,7 +126,7 @@ class OverlayView(context: Context) : View(context) {
 }
 
 class TranslatorAccessibilityService : AccessibilityService() {
-    private class Item(val text: String, val rect: Rect, val srcSize: Float, val fromImage: Boolean, val id: Int, val maxLines: Int = 3)
+    private class Item(val text: String, val rect: Rect, val srcSize: Float, val fromImage: Boolean, val id: Int, val maxLines: Int = 6)
     private var overlayView: OverlayView? = null
     private var buttonView: TextView? = null
     private var buttonBg: GradientDrawable? = null
@@ -540,6 +561,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val w = if (innerW < 4) 4 else innerW
         var lines = Math.ceil((total / w).toDouble()).toInt()
         if (lines < 1) lines = 1
+        lines = lines + 1
         return Pair((lines * lineH).toInt(), lineH)
     }
 
@@ -552,6 +574,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val hardMax = 26f * d
         val maxW = screenWidth - margin * 2
         val minW = dpToPx(60)
+        val rightZone = screenWidth - dpToPx(24)
         val sorted = list.sortedWith(Comparator { a, b ->
             if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
         })
@@ -561,39 +584,40 @@ class TranslatorAccessibilityService : AccessibilityService() {
             if (size < minSize) size = minSize
             if (size > hardMax) size = hardMax
             val orig = cand.rect
-            var width = orig.width()
-            if (width < minW) width = minW
-            if (width > maxW) width = maxW
-            var res = estHeight(cand.text, width - padSide * 2, size)
-            var lineH = res.second
-            var allowH = Math.max(orig.height() + (4f * d).toInt(), (lineH * 2f).toInt() + padSide * 2)
-            if (res.first + padSide * 2 > allowH && width < maxW) {
-                width = maxW
-                res = estHeight(cand.text, width - padSide * 2, size)
-                lineH = res.second
-            }
-            var guard = 0
-            while (res.first + padSide * 2 > allowH && size > minSize && guard < 40) {
-                size = size - 1f
-                if (size < minSize) size = minSize
-                res = estHeight(cand.text, width - padSide * 2, size)
-                lineH = res.second
-                guard++
-            }
-            val capH = (lineH * BOX_MAX_LINES.toFloat()).toInt()
-            var boxH = res.first
-            if (boxH > capH) boxH = capH
-            boxH = boxH + padSide * 2
             measurePaint.textSize = size
             val singleW = Math.ceil(measurePaint.measureText(cand.text).toDouble()).toInt() + padSide * 2
-            var boxW = if (singleW <= width) singleW else width
-            if (boxW < minBoxWidth) boxW = minBoxWidth
+            var baseW = orig.width()
+            if (baseW < minW) baseW = minW
+            if (baseW > maxW) baseW = maxW
+            var boxW = if (singleW > baseW) singleW else baseW
             if (boxW > maxW) boxW = maxW
-            var left = orig.left
-            if (left + boxW > screenWidth - margin) left = orig.right - boxW
-            if (left + boxW > screenWidth - margin) left = screenWidth - margin - boxW
-            if (left < margin) left = margin
-            var top = orig.top + (orig.height() - boxH) / 2
+            var guard = 0
+            var res = estHeight(cand.text, boxW - padSide * 2, size)
+            var lineH = res.second
+            var capH = (lineH * BOX_MAX_LINES.toFloat()).toInt() + padSide * 2
+            while (guard < 40 && size > minSize && res.first + padSide * 2 > capH) {
+                size = size - 1f
+                if (size < minSize) size = minSize
+                res = estHeight(cand.text, boxW - padSide * 2, size)
+                lineH = res.second
+                capH = (lineH * BOX_MAX_LINES.toFloat()).toInt() + padSide * 2
+                guard++
+            }
+            var boxH = res.first + padSide * 2
+            if (boxH > capH) boxH = capH
+            if (boxH < orig.height()) boxH = orig.height()
+            if (boxH < minBoxHeight) boxH = minBoxHeight
+            val rightAnchored = orig.right >= rightZone
+            var left: Int
+            if (rightAnchored) {
+                left = orig.right - boxW
+                if (left < margin) left = margin
+            } else {
+                left = orig.left
+                if (left + boxW > screenWidth - margin) left = screenWidth - margin - boxW
+                if (left < margin) left = margin
+            }
+            var top = orig.top
             if (top + boxH > screenHeight - margin) top = screenHeight - margin - boxH
             if (top < margin) top = margin
             val r = Rect(left, top, left + boxW, top + boxH)
@@ -840,10 +864,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
         sb.append("নিয়ম:").append(nl)
         sb.append("1) তালিকার প্রতিটি নম্বরের জন্য অবশ্যই একটি ফলাফল দিতে হবে, কিছু বাদ দেওয়া যাবে না।").append(nl)
         sb.append("2) মোট ").append(chunk.size).append(" টি আইটেম আছে, তাই ঠিক ").append(chunk.size).append(" টি ফলাফল দাও।").append(nl)
-        sb.append("3) অনুবাদ যত সম্ভব ছোট রাখো, মূল লাইনের চেয়ে অনেক বড় করবে না।").append(nl)
+        sb.append("3) অনুবাদ ছোট রাখো কিন্তু মূল লেখার সম্পূর্ণ অর্থ থাকবে; মাঝপথে কাটবে না।").append(nl)
         sb.append("4) নাম, ব্র্যান্ড, সংখ্যা, সময়, মডেল, লিংক, কোড অপরিবর্তিত রাখো।").append(nl)
         sb.append("5) কোনো ব্যাখ্যা, নোট বা অতিরিক্ত লেখা দেবে না।").append(nl)
         sb.append("6) লেখা ইতিমধ্যে বাংলা হলে হুবহু ফিরত দাও।").append(nl)
+        sb.append("7) বাংলা অনুবাদ যেন স্বাভাবিক ও প্রাঞ্জল হয়, শব্দে শব্দে নয়; যেকোনো ভাষা থেকে বাংলায় অনুবাদ করবে।").append(nl)
         sb.append("শুধু এই JSON ফরম্যাটে উত্তর দাও: {translations:[{id:1,translated_text:বাংলা}]}").append(nl)
         sb.append("লাইনের তালিকা:").append(nl)
         for (i in chunk.indices) {
@@ -1228,7 +1253,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val MAX_NODES = 400
         private const val MAX_ITEMS = 100
         private const val CHUNK = 30
-        private const val BOX_MAX_LINES = 3
+        private const val BOX_MAX_LINES = 6
         private const val COLOR_IDLE = "#2196F3"
         private const val COLOR_BUSY = "#FF9800"
         private const val COLOR_DONE = "#4CAF50"
