@@ -23,6 +23,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Base64
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.widget.ImageView
 import android.widget.TextView
@@ -43,6 +44,8 @@ class TranslationService : Service() {
     private var overlayImage: ImageView? = null
     private var buttonView: TextView? = null
     private var buttonBg: GradientDrawable? = null
+    private var buttonParams: android.view.WindowManager.LayoutParams? = null
+    private var windowManager: android.view.WindowManager? = null
     private val handler = Handler(Looper.getMainLooper())
     private var currentKeyIndex = 0
     private var currentModelIndex = 0
@@ -50,12 +53,14 @@ class TranslationService : Service() {
     private var screenHeight = 1
     private var isCapturing = false
     private var isOverlayShowing = false
+    private var pendingCapture = false
     private var serviceOn = false
+    private var buttonSize = 1
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -73,6 +78,7 @@ class TranslationService : Service() {
         val metrics = resources.displayMetrics
         screenWidth = metrics.widthPixels
         screenHeight = metrics.heightPixels
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
 
         setupOverlayImage()
         setupFloatingButton()
@@ -86,7 +92,18 @@ class TranslationService : Service() {
                 val data = intent.getParcelableExtra<Intent>("data")
                 if (resultCode != -1 && data != null && mediaProjection == null) {
                     initProjection(resultCode, data)
-                    Toast.makeText(this, "ফ্লোটিং বাটন এসেছে! যে কোনো অ্যাপে গিয়ে বাটনে চাপুন", Toast.LENGTH_LONG).show()
+                }
+                Toast.makeText(this, "ফ্লোটিং বাটনে চাপ দিন, অনুবাদ হবে", Toast.LENGTH_LONG).show()
+            }
+            "PROJECTION_RESULT" -> {
+                val resultCode = intent.getIntExtra("resultCode", -1)
+                val data = intent.getParcelableExtra<Intent>("data")
+                if (resultCode != -1 && data != null) {
+                    initProjection(resultCode, data)
+                }
+                if (pendingCapture) {
+                    pendingCapture = false
+                    handler.postDelayed({ beginTranslation() }, 300)
                 }
             }
             "STOP_TRANSLATION" -> {
@@ -101,8 +118,7 @@ class TranslationService : Service() {
         mediaProjection = manager.getMediaProjection(resultCode, data)
 
         if (mediaProjection == null) {
-            Toast.makeText(this, "MediaProjection শুরু করা যায়নি", Toast.LENGTH_SHORT).show()
-            stopAll()
+            Toast.makeText(this, "স্ক্রিন ক্যাপচার অনুমতি পাওয়া যায়নি", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -124,32 +140,81 @@ class TranslationService : Service() {
         buttonView = TextView(this).apply {
             text = "অ"
             setTextColor(Color.WHITE)
-            textSize = 24f
+            textSize = 16f
             gravity = Gravity.CENTER
             background = buttonBg
         }
 
-        val size = dpToPx(60)
-        val params = android.view.WindowManager.LayoutParams(
-            size, size,
+        buttonSize = dpToPx(44)
+        buttonParams = android.view.WindowManager.LayoutParams(
+            buttonSize, buttonSize,
             android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
-        params.gravity = Gravity.TOP or Gravity.START
-        params.x = dpToPx(8)
-        params.y = screenHeight / 2
+        buttonParams?.gravity = Gravity.TOP or Gravity.START
+        buttonParams?.x = dpToPx(8)
+        buttonParams?.y = screenHeight / 2
 
-        buttonView?.setOnClickListener { onButtonTap() }
-        buttonView?.setOnLongClickListener {
-            Toast.makeText(this, "সার্ভিস বন্ধ হচ্ছে", Toast.LENGTH_SHORT).show()
-            stopAll()
-            true
-        }
+        attachButtonTouch()
 
-        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-        wm.addView(buttonView, params)
+        windowManager?.addView(buttonView, buttonParams)
+    }
+
+    private fun attachButtonTouch() {
+        buttonView?.setOnTouchListener(object : View.OnTouchListener {
+            private var downX = 0f
+            private var downY = 0f
+            private var startX = 0f
+            private var startY = 0f
+            private var downTime = 0L
+            private var moved = false
+
+            override fun onTouch(v: View, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = event.rawX
+                        downY = event.rawY
+                        startX = (buttonParams?.x ?: 0).toFloat()
+                        startY = (buttonParams?.y ?: 0).toFloat()
+                        downTime = System.currentTimeMillis()
+                        moved = false
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = event.rawX - downX
+                        val dy = event.rawY - downY
+                        if (Math.abs(dx) > 15 || Math.abs(dy) > 15) moved = true
+                        if (moved) {
+                            var nx = (startX + dx).toInt()
+                            var ny = (startY + dy).toInt()
+                            if (nx < 0) nx = 0
+                            if (ny < 0) ny = 0
+                            if (nx > screenWidth - buttonSize) nx = screenWidth - buttonSize
+                            if (ny > screenHeight - buttonSize) ny = screenHeight - buttonSize
+                            buttonParams?.x = nx
+                            buttonParams?.y = ny
+                            try {
+                                windowManager?.updateViewLayout(v, buttonParams)
+                            } catch (e: Exception) { }
+                        }
+                        return true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val dt = System.currentTimeMillis() - downTime
+                        if (!moved && dt < 500) {
+                            onButtonTap()
+                        } else if (!moved && dt >= 500) {
+                            Toast.makeText(this@TranslationService, "সার্ভিস বন্ধ হচ্ছে", Toast.LENGTH_SHORT).show()
+                            stopAll()
+                        }
+                        return true
+                    }
+                }
+                return true
+            }
+        })
     }
 
     private fun setupOverlayImage() {
@@ -184,24 +249,32 @@ class TranslationService : Service() {
 
     private fun beginTranslation() {
         if (mediaProjection == null) {
-            Toast.makeText(this, "আগে মেইন অ্যাপ থেকে অনুবাদ শুরু করুন", Toast.LENGTH_LONG).show()
+            pendingCapture = true
+            setButtonColor("#FF9800")
+            Toast.makeText(this, "একবার অনুমতি দিন, তারপর নিজে থেকেই অনুবাদ হবে", Toast.LENGTH_LONG).show()
+            val i = Intent(this, CaptureActivity::class.java)
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(i)
             return
         }
         isCapturing = true
+        setButtonColor("#FF9800")
+        Toast.makeText(this, "অনুবাদ হচ্ছে...", Toast.LENGTH_SHORT).show()
         buttonView?.visibility = View.GONE
         overlayImage?.visibility = View.INVISIBLE
-        handler.postDelayed({ captureNow(0) }, 900)
+        handler.postDelayed({ captureNow(0) }, 500)
     }
 
     private fun captureNow(retry: Int) {
         val image = imageReader?.acquireLatestImage()
         if (image == null) {
             if (retry < 3) {
-                handler.postDelayed({ captureNow(retry + 1) }, 400)
+                handler.postDelayed({ captureNow(retry + 1) }, 300)
             } else {
                 isCapturing = false
                 buttonView?.visibility = View.VISIBLE
-                Toast.makeText(this, "স্ক্রিন ধরা যায়নি, আবার চেষ্টা করুন", Toast.LENGTH_SHORT).show()
+                setButtonColor("#2196F3")
+                Toast.makeText(this, "স্ক্রিন ধরা যায়নি, আবার চাপ দিন", Toast.LENGTH_SHORT).show()
             }
             return
         }
@@ -231,8 +304,17 @@ class TranslationService : Service() {
             handler.post {
                 Toast.makeText(this, "সেটিংসে key বা model নেই", Toast.LENGTH_SHORT).show()
                 isCapturing = false
+                setButtonColor("#2196F3")
             }
             return
+        }
+
+        var apiBitmap = bitmap
+        if (apiBitmap.width > 1024) {
+            val ratio = 1024.0f / apiBitmap.width
+            apiBitmap = Bitmap.createScaledBitmap(
+                bitmap, 1024, (bitmap.height * ratio).toInt(), true
+            )
         }
 
         val totalCombos = keys.size * models.size
@@ -243,13 +325,13 @@ class TranslationService : Service() {
             val key = keys[currentKeyIndex]
             val model = models[currentModelIndex]
             saveCurrentCombo(key, model)
-            val result = callGeminiAPI(key, model, bitmap)
+            val result = callGeminiAPI(key, model, apiBitmap)
             if (result != null) {
                 resultText = result
             } else {
                 moveToNextCombo(keys.size, models.size)
                 attempts++
-                Thread.sleep(400)
+                Thread.sleep(300)
             }
         }
 
@@ -260,6 +342,7 @@ class TranslationService : Service() {
                 isOverlayShowing = true
                 isCapturing = false
                 setButtonColor("#4CAF50")
+                Toast.makeText(this, "অনুবাদ সম্পন্ন", Toast.LENGTH_SHORT).show()
             }
         } else {
             handler.post {
@@ -275,7 +358,7 @@ class TranslationService : Service() {
     private fun callGeminiAPI(key: String, model: String, bitmap: Bitmap): String? {
         try {
             val outputStream = ByteArrayOutputStream()
-            bitmap.compress(Bitmap.CompressFormat.PNG, 85, outputStream)
+            bitmap.compress(Bitmap.CompressFormat.PNG, 70, outputStream)
             val base64Image = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
             val prompt = "এই ছবির সব লেখা শনাক্ত করো এবং বাংলায় অনুবাদ করো। " +
