@@ -105,7 +105,7 @@ class OverlayView(context: Context) : View(context) {
 }
 
 class TranslatorAccessibilityService : AccessibilityService() {
-    private class Item(val text: String, val rect: Rect, val srcSize: Float, val fromImage: Boolean, val id: Int, val maxLines: Int = BOX_MAX_LINES)
+    private class Item(val text: String, val rect: Rect, val srcSize: Float, val fromImage: Boolean, val id: Int, val maxLines: Int = 3)
     private var overlayView: OverlayView? = null
     private var buttonView: TextView? = null
     private var buttonBg: GradientDrawable? = null
@@ -917,6 +917,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
             parts.put(textPart)
             val content = JSONObject()
             content.put("role", "user")
+            content.put("parts", parts)
             val contents = JSONArray()
             contents.put(content)
             val gen = JSONObject()
