@@ -28,6 +28,12 @@
             android:name=".SettingsActivity"
             android:exported="false" />
 
+        <activity
+            android:name=".CaptureActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
         <service
             android:name=".TranslationService"
             android:exported="false"
