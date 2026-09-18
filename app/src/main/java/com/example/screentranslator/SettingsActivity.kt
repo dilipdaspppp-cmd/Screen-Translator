@@ -50,7 +50,7 @@ class SettingsActivity : Activity() {
 
                 apply()
             }
-            Toast.makeText(this, "সেটিংস সেভ হয়েছে!", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(R.string.msg_saved), Toast.LENGTH_SHORT).show()
             finish()
         }
     }
