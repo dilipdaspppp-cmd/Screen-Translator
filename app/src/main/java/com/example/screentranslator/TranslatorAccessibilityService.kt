@@ -1,14 +1,17 @@
 package com.example.screentranslator
 
 import android.accessibilityservice.AccessibilityService
+import android.content.BroadcastReceiver
 import android.content.Context
-import android.graphics.Bitmap
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -16,7 +19,6 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
-import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import okhttp3.MediaType.Companion.toMediaType
@@ -27,8 +29,87 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+class OverlayView : View {
+    data class Entry(val text: String, val rect: Rect)
+
+    private var entries: List<Entry> = emptyList()
+    private val bgPaint = Paint().apply { color = Color.argb(235, 20, 20, 20) }
+    private val textPaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+    }
+    private var offX = 0
+    private var offY = 0
+    private var resolved = false
+
+    constructor(context: Context) : super(context)
+
+    fun setEntries(list: List<Entry>) {
+        entries = list
+        resolved = false
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (!resolved) {
+            val loc = IntArray(2)
+            getLocationOnScreen(loc)
+            offX = loc[0]
+            offY = loc[1]
+            resolved = true
+        }
+        for (en in entries) {
+            val l = en.rect.left.toFloat() - offX - 2f
+            val t = en.rect.top.toFloat() - offY - 2f
+            val r = en.rect.right.toFloat() - offX + 2f
+            val b = en.rect.bottom.toFloat() - offY + 2f
+            val w = r - l
+            val h = b - t
+            if (w <= 0 || h <= 0) continue
+
+            canvas.drawRect(l, t, r, b, bgPaint)
+
+            textPaint.textSize = h * 0.7f
+            var lines = wrap(en.text, textPaint, w - 8f)
+            while (lines.size * textPaint.textSize * 1.25f > h && textPaint.textSize > 9f) {
+                textPaint.textSize = textPaint.textSize - 2f
+                lines = wrap(en.text, textPaint, w - 8f)
+            }
+
+            val totalH = lines.size * textPaint.textSize * 1.25f
+            var y = t + (h - totalH) / 2f + textPaint.textSize
+            for (line in lines) {
+                canvas.drawText(line, l + 4f, y, textPaint)
+                y += textPaint.textSize * 1.25f
+            }
+        }
+    }
+
+    private fun wrap(text: String, paint: Paint, maxWidth: Float): List<String> {
+        if (maxWidth <= 0) return listOf(text)
+        val words = text.split(' ')
+        val lines = ArrayList<String>()
+        val current = StringBuilder()
+        for (w in words) {
+            val test = if (current.isEmpty()) w else current.toString() + " " + w
+            if (paint.measureText(test) > maxWidth && current.isNotEmpty()) {
+                lines.add(current.toString())
+                current.clear()
+                current.append(w)
+            } else {
+                current.clear()
+                current.append(test)
+            }
+        }
+        if (current.isNotEmpty()) lines.add(current.toString())
+        if (lines.isEmpty()) lines.add(text)
+        return lines
+    }
+}
+
 class TranslatorAccessibilityService : AccessibilityService() {
-    private var overlayImage: ImageView? = null
+    private var overlayView: OverlayView? = null
     private var buttonView: TextView? = null
     private var buttonBg: GradientDrawable? = null
     private var buttonParams: android.view.WindowManager.LayoutParams? = null
@@ -43,6 +124,15 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var buttonSize = 1
     private var uiReady = false
 
+    private var exitReceiver: BroadcastReceiver? = null
+
+    private val longPressRunnable = Runnable {
+        getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+            .putBoolean("uiOff", true).apply()
+        syncUiState()
+        Toast.makeText(this, "বাটন লুকানো হয়েছে। চালু করতে মেইন অ্যাপে যান", Toast.LENGTH_SHORT).show()
+    }
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
@@ -55,10 +145,24 @@ class TranslatorAccessibilityService : AccessibilityService() {
         screenWidth = metrics.widthPixels
         screenHeight = metrics.heightPixels
         windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-        setupOverlayImage()
+        setupOverlay()
         setupFloatingButton()
         uiReady = true
         syncUiState()
+
+        exitReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == "com.example.screentranslator.EXIT") {
+                    shutdown()
+                }
+            }
+        }
+        val filter = IntentFilter("com.example.screentranslator.EXIT")
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(exitReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(exitReceiver, filter)
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -75,11 +179,28 @@ class TranslatorAccessibilityService : AccessibilityService() {
             .getBoolean("uiOff", false)
         if (off) {
             buttonView?.visibility = View.GONE
-            overlayImage?.visibility = View.INVISIBLE
+            overlayView?.visibility = View.INVISIBLE
             isOverlayShowing = false
         } else {
             buttonView?.visibility = View.VISIBLE
         }
+    }
+
+    private fun setupOverlay() {
+        overlayView = OverlayView(this).apply {
+            visibility = View.INVISIBLE
+        }
+        val params = android.view.WindowManager.LayoutParams(
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        windowManager?.addView(overlayView, params)
     }
 
     private fun setupFloatingButton() {
@@ -129,12 +250,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
                         startY = (buttonParams?.y ?: 0).toFloat()
                         downTime = System.currentTimeMillis()
                         moved = false
+                        handler.postDelayed(longPressRunnable, 900)
                         return true
                     }
                     MotionEvent.ACTION_MOVE -> {
                         val dx = event.rawX - downX
                         val dy = event.rawY - downY
-                        if (Math.abs(dx) > 15 || Math.abs(dy) > 15) moved = true
+                        if (!moved && (Math.abs(dx) > 30 || Math.abs(dy) > 30)) {
+                            moved = true
+                            handler.removeCallbacks(longPressRunnable)
+                        }
                         if (moved) {
                             var nx = (startX + dx).toInt()
                             var ny = (startY + dy).toInt()
@@ -151,14 +276,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
+                        handler.removeCallbacks(longPressRunnable)
                         val dt = System.currentTimeMillis() - downTime
                         if (!moved && dt < 500) {
                             onButtonTap()
-                        } else if (!moved && dt >= 500) {
-                            getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
-                                .putBoolean("uiOff", true).apply()
-                            syncUiState()
-                            Toast.makeText(this@TranslatorAccessibilityService, "বন্ধ হয়েছে", Toast.LENGTH_SHORT).show()
                         }
                         return true
                     }
@@ -168,28 +289,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
         })
     }
 
-    private fun setupOverlayImage() {
-        overlayImage = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.FIT_XY
-            visibility = View.INVISIBLE
-        }
-        val params = android.view.WindowManager.LayoutParams(
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        )
-        params.gravity = Gravity.TOP or Gravity.START
-        windowManager?.addView(overlayImage, params)
-    }
-
     private fun onButtonTap() {
         if (isWorking) return
         if (isOverlayShowing) {
-            overlayImage?.visibility = View.INVISIBLE
+            overlayView?.visibility = View.INVISIBLE
             isOverlayShowing = false
             setButtonColor("#2196F3")
         } else {
@@ -202,7 +305,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         setButtonColor("#FF9800")
         Toast.makeText(this, "অনুবাদ হচ্ছে...", Toast.LENGTH_SHORT).show()
         buttonView?.visibility = View.GONE
-        overlayImage?.visibility = View.INVISIBLE
+        overlayView?.visibility = View.INVISIBLE
         handler.postDelayed({ collectAndTranslate() }, 250)
     }
 
@@ -241,7 +344,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val r = Rect()
             node.getBoundsInScreen(r)
             if (r.width() > 0 && r.height() > 0) {
-                items.add(Item(t.replace(CHAR_NL, ' '), r))
+                var clean = t.replace(CHAR_NL, ' ')
+                if (clean.length > 700) clean = clean.substring(0, 700)
+                items.add(Item(clean, r))
             }
         }
         for (i in 0 until node.childCount) {
@@ -290,7 +395,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         if (resultText != null) {
             val finalText = resultText
             handler.post {
-                drawAndShowOverlay(finalText, items)
+                showOverlay(finalText, items)
                 isOverlayShowing = true
                 isWorking = false
                 setButtonColor("#4CAF50")
@@ -309,10 +414,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun buildPrompt(items: List<Item>): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("নিচের প্রতিটি লাইন আলাদা লেখা। সব লাইন বাংলায় অনুবাদ করো। ")
-        sb.append("লেখা আগে থেকে বাংলায় থাকলে হুবহু রেখে দিও। ")
-        sb.append("উত্তর হবে valid JSON: translations নামে array, ক্রম একই থাকবে, প্রতিটি entry তে translated_text। ")
-        sb.append("লাইনগুলো:")
+        sb.append("তুমি একজন দক্ষ অনুবাদক। নিচে বিভিন্ন ভাষার লেখা দেওয়া আছে (ইংরেজি, চাইনিজ, উইঘুর বা অন্য যেকোনো ভাষা হতে পারে)। ")
+        sb.append("প্রতিটি লাইনকে অত্যন্ত সাবলীল, প্রাঞ্জল ও স্বাভাবিক বাংলায় অনুবাদ করো, যেন মনে হয় বাংলাতেই লেখা হয়েছিল। ")
+        sb.append("অর্থ যেন বিকৃত না হয়। লাইনে শুধু সংখ্যা বা কোড থাকলে সেটি হুবহু রেখে দিও। আগে থেকে বাংলায় থাকলে হুবহু রেখে দিও। ")
+        sb.append("উত্তর হবে valid JSON: translations নামে array, প্রতিটি entry তে id এবং translated_text। ")
+        sb.append("একটি id-ও বাদ দেবে না, ক্রম একই থাকবে। লাইনগুলো:")
         sb.append(nl)
         for (i in items.indices) {
             sb.append(i + 1).append(". ").append(items[i].text).append(nl)
@@ -370,17 +476,25 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun drawAndShowOverlay(responseText: String, items: List<Item>) {
+    private fun showOverlay(responseText: String, items: List<Item>) {
         try {
             val json = JSONObject(responseText)
             val translations = json.getJSONArray("translations")
 
-            val bitmap = Bitmap.createBitmap(screenWidth, screenHeight, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
+            val byId = HashMap<Int, String>()
+            for (i in 0 until translations.length()) {
+                val entry = translations.opt(i)
+                if (entry is JSONObject) {
+                    val id = entry.optInt("id", i + 1)
+                    val tr = entry.optString("translated_text", "")
+                    if (tr.isNotBlank()) byId[id] = tr
+                }
+            }
 
-            for (i in 0 until items.size) {
-                var translated = ""
-                if (i < translations.length()) {
+            val entries = ArrayList<OverlayView.Entry>()
+            for (i in items.indices) {
+                var translated = byId[i + 1]
+                if (translated == null && i < translations.length()) {
                     val entry = translations.opt(i)
                     if (entry is JSONObject) {
                         translated = entry.optString("translated_text", "")
@@ -388,62 +502,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
                         translated = entry.toString()
                     }
                 }
-                if (translated.isBlank()) continue
-
-                val r = items[i].rect
-                val left = r.left.toFloat()
-                val top = r.top.toFloat()
-                val right = r.right.toFloat()
-                val bottom = r.bottom.toFloat()
-                val boxWidth = right - left
-                val boxHeight = bottom - top
-
-                val bgPaint = Paint().apply { color = Color.argb(230, 25, 25, 25) }
-                canvas.drawRect(left, top, right, bottom, bgPaint)
-
-                val paint = Paint().apply {
-                    color = Color.WHITE
-                    isAntiAlias = true
-                    textSize = boxHeight * 0.6f
-                }
-                var lines = wrapText(translated, paint, boxWidth)
-                while (lines.size * paint.textSize * 1.2f > boxHeight && paint.textSize > 9f) {
-                    paint.textSize = paint.textSize - 2f
-                    lines = wrapText(translated, paint, boxWidth)
-                }
-
-                var y = top + paint.textSize * 1.1f
-                for (line in lines) {
-                    canvas.drawText(line, left + 4f, y, paint)
-                    y += paint.textSize * 1.2f
-                }
+                if (translated.isNullOrBlank()) continue
+                if (translated == items[i].text) continue
+                entries.add(OverlayView.Entry(translated, items[i].rect))
             }
 
-            overlayImage?.setImageBitmap(bitmap)
-            overlayImage?.visibility = View.VISIBLE
+            overlayView?.setEntries(entries)
+            overlayView?.visibility = View.VISIBLE
         } catch (e: Exception) {
             e.printStackTrace()
         }
-    }
-
-    private fun wrapText(text: String, paint: Paint, maxWidth: Float): List<String> {
-        val words = text.split(' ')
-        val lines = ArrayList<String>()
-        val current = StringBuilder()
-        for (w in words) {
-            val test = if (current.isEmpty()) w else current.toString() + " " + w
-            if (paint.measureText(test) > maxWidth && current.isNotEmpty()) {
-                lines.add(current.toString())
-                current.clear()
-                current.append(w)
-            } else {
-                current.clear()
-                current.append(test)
-            }
-        }
-        if (current.isNotEmpty()) lines.add(current.toString())
-        if (lines.isEmpty()) lines.add(text)
-        return lines
     }
 
     private fun resetWork() {
@@ -501,13 +569,34 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun shutdown() {
+        uiReady = false
+        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+        try {
+            buttonView?.let { wm.removeView(it) }
+        } catch (e: Exception) { }
+        try {
+            overlayView?.let { wm.removeView(it) }
+        } catch (e: Exception) { }
+        buttonView = null
+        overlayView = null
+        try {
+            exitReceiver?.let { unregisterReceiver(it) }
+        } catch (e: Exception) { }
+        exitReceiver = null
+        disableSelf()
+    }
+
     override fun onDestroy() {
         val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
         try {
             buttonView?.let { wm.removeView(it) }
         } catch (e: Exception) { }
         try {
-            overlayImage?.let { wm.removeView(it) }
+            overlayView?.let { wm.removeView(it) }
+        } catch (e: Exception) { }
+        try {
+            exitReceiver?.let { unregisterReceiver(it) }
         } catch (e: Exception) { }
         super.onDestroy()
     }
