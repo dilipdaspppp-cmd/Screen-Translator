@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -14,9 +15,14 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
@@ -29,122 +35,123 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-class OverlayView : View {
-    data class Entry(val text: String, val orig: String, val rect: Rect)
+class OverlayView(context: Context) : View(context) {
 
-    private var entries: List<Entry> = emptyList()
-    private val bgPaint = Paint().apply { color = Color.rgb(22, 22, 22) }
-    private val textPaint = Paint().apply {
+    data class Entry(val text: String, val rect: Rect)
+
+    private class Drawn(val rect: Rect, val layout: StaticLayout, val pad: Float)
+
+    private var drawn: List<Drawn> = emptyList()
+
+    private val bgPaint = Paint().apply {
+        color = Color.rgb(20, 20, 20)
+        isAntiAlias = false
+    }
+
+    private val textPaint = TextPaint().apply {
         color = Color.WHITE
         isAntiAlias = true
     }
 
-    constructor(context: Context) : super(context)
-
     fun setEntries(list: List<Entry>) {
-        entries = list
+        val density = resources.displayMetrics.density
+        val pad = 3f * density
+        val maxSize = 20f * density
+        val minSize = 8f * density
+        val out = ArrayList<Drawn>()
+        for (en in list) {
+            val w = en.rect.width()
+            val h = en.rect.height()
+            if (w <= 0 || h <= 0) continue
+            val innerW = (w - pad * 2f).toInt()
+            if (innerW <= 2) continue
+            val innerH = h.toFloat() - 2f
+            if (innerH <= 2f) continue
+            val layout = fit(en.text, innerW, innerH, maxSize, minSize)
+            out.add(Drawn(Rect(en.rect), layout, pad))
+        }
+        drawn = out
         invalidate()
+    }
+
+    private fun fit(text: String, width: Int, height: Float, maxSize: Float, minSize: Float): StaticLayout {
+        var size = maxSize
+        if (size > height) size = height
+        if (size < minSize) size = minSize
+        var layout = build(text, width, size, 0)
+        var guard = 0
+        while (layout.height > height && size > minSize && guard < 80) {
+            size = size - 1f
+            if (size < minSize) size = minSize
+            layout = build(text, width, size, 0)
+            guard++
+        }
+        if (layout.height > height) {
+            textPaint.textSize = minSize
+            val fm = textPaint.fontMetrics
+            var lineH = fm.descent - fm.ascent
+            if (lineH < 1f) lineH = 1f
+            var maxLines = (height / lineH).toInt()
+            if (maxLines < 1) maxLines = 1
+            layout = build(text, width, minSize, maxLines)
+        }
+        return layout
+    }
+
+    private fun build(text: String, width: Int, size: Float, maxLines: Int): StaticLayout {
+        textPaint.textSize = size
+        val builder = StaticLayout.Builder.obtain(text, 0, text.length, textPaint, width)
+            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+            .setLineSpacing(0f, 1f)
+            .setIncludePad(false)
+        if (maxLines > 0) {
+            builder.setMaxLines(maxLines)
+            builder.setEllipsize(TextUtils.TruncateAt.END)
+        }
+        return builder.build()
     }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        if (entries.isEmpty()) return
+        if (drawn.isEmpty()) return
 
         val loc = IntArray(2)
         getLocationOnScreen(loc)
         val offX = loc[0]
         val offY = loc[1]
 
-        val density = resources.displayMetrics.density
-        val cap = 20f * density
-        val inner = 3f * density
-
-        for (en in entries) {
-            val l = en.rect.left.toFloat() - offX
-            val t = en.rect.top.toFloat() - offY
-            val r = en.rect.right.toFloat() - offX
-            val b = en.rect.bottom.toFloat() - offY
-            val w = r - l
-            val h = b - t
-            if (w <= 0f || h <= 0f) continue
+        for (d in drawn) {
+            val l = (d.rect.left - offX).toFloat()
+            val t = (d.rect.top - offY).toFloat()
+            val r = (d.rect.right - offX).toFloat()
+            val b = (d.rect.bottom - offY).toFloat()
+            if (r <= l || b <= t) continue
 
             canvas.drawRect(l, t, r, b, bgPaint)
 
-            val usableW = w - inner * 2f
-            if (usableW <= 0f) continue
-
-            textPaint.textSize = cap
-            val origLines = wrap(en.orig, textPaint, usableW).size
-            val est = h / (origLines * 1.22f)
-            var size = if (cap < est) cap else est
-            if (size < 9f) size = 9f
-            textPaint.textSize = size
-
-            var lines = wrap(en.text, textPaint, usableW)
-            while (lines.size * textPaint.textSize * 1.22f > h && textPaint.textSize > 8f) {
-                textPaint.textSize = textPaint.textSize - 1f
-                lines = wrap(en.text, textPaint, usableW)
-            }
-
-            val totalH = lines.size * textPaint.textSize * 1.22f
-            var y = t + (h - totalH) / 2f + textPaint.textSize
+            var dy = t + ((b - t) - d.layout.height) / 2f
+            if (dy < t) dy = t
 
             canvas.save()
             canvas.clipRect(l, t, r, b)
-            for (line in lines) {
-                canvas.drawText(line, l + inner, y, textPaint)
-                y += textPaint.textSize * 1.22f
-            }
+            canvas.translate(l + d.pad, dy)
+            d.layout.draw(canvas)
             canvas.restore()
         }
-    }
-
-    private fun wrap(text: String, paint: Paint, maxWidth: Float): List<String> {
-        if (maxWidth <= 0f) return listOf(text)
-        val words = ArrayList<String>()
-        for (raw in text.split(' ')) {
-            if (raw.isEmpty()) continue
-            if (paint.measureText(raw) <= maxWidth) {
-                words.add(raw)
-            } else {
-                val chunk = StringBuilder()
-                for (ch in raw) {
-                    val test = chunk.toString() + ch
-                    if (paint.measureText(test) > maxWidth && chunk.isNotEmpty()) {
-                        words.add(chunk.toString())
-                        chunk.clear()
-                    }
-                    chunk.append(ch)
-                }
-                if (chunk.isNotEmpty()) words.add(chunk.toString())
-            }
-        }
-        val lines = ArrayList<String>()
-        val current = StringBuilder()
-        for (w in words) {
-            val test = if (current.isEmpty()) w else current.toString() + " " + w
-            if (paint.measureText(test) > maxWidth && current.isNotEmpty()) {
-                lines.add(current.toString())
-                current.clear()
-                current.append(w)
-            } else {
-                current.clear()
-                current.append(test)
-            }
-        }
-        if (current.isNotEmpty()) lines.add(current.toString())
-        if (lines.isEmpty()) lines.add(text)
-        return lines
     }
 }
 
 class TranslatorAccessibilityService : AccessibilityService() {
+
+    private data class Item(val text: String, val rect: Rect)
+
     private var overlayView: OverlayView? = null
     private var buttonView: TextView? = null
     private var buttonBg: GradientDrawable? = null
-    private var buttonParams: android.view.WindowManager.LayoutParams? = null
-    private var windowManager: android.view.WindowManager? = null
+    private var buttonParams: WindowManager.LayoutParams? = null
+    private var windowManager: WindowManager? = null
     private val handler = Handler(Looper.getMainLooper())
+
     private var currentKeyIndex = 0
     private var currentModelIndex = 0
     private var screenWidth = 1
@@ -154,15 +161,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var overlayShownAt = 0L
     private var buttonSize = 1
     private var minBoxHeight = 1
+    private var minBoxWidth = 1
     private var uiReady = false
 
-    private var exitReceiver: BroadcastReceiver? = null
+    private var receiver: BroadcastReceiver? = null
 
     private val longPressRunnable = Runnable {
         getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
             .putBoolean("uiOff", true).apply()
         syncUiState()
-        Toast.makeText(this, getString(R.string.msg_button_hidden), Toast.LENGTH_SHORT).show()
+        toast(getString(R.string.msg_button_hidden))
     }
 
     private val client = OkHttpClient.Builder()
@@ -171,30 +179,86 @@ class TranslatorAccessibilityService : AccessibilityService() {
         .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    override fun onCreate() {
-        super.onCreate()
-        val metrics = resources.displayMetrics
-        screenWidth = metrics.widthPixels
-        screenHeight = metrics.heightPixels
-        minBoxHeight = dpToPx(11)
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-        setupOverlay()
-        setupFloatingButton()
-        uiReady = true
-        syncUiState()
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        if (uiReady) {
+            refreshMetrics()
+            syncUiState()
+            return
+        }
+        try {
+            windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            refreshMetrics()
+            minBoxHeight = dpToPx(11)
+            minBoxWidth = dpToPx(16)
+            setupOverlay()
+            setupFloatingButton()
+            uiReady = true
+            registerReceivers()
+            syncUiState()
+        } catch (e: Exception) {
+            uiReady = false
+        }
+    }
 
-        exitReceiver = object : BroadcastReceiver() {
+    private fun registerReceivers() {
+        if (receiver != null) return
+        receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action == "com.example.screentranslator.EXIT") {
+                val action = intent?.action ?: return
+                if (action == "com.example.screentranslator.EXIT") {
                     shutdown()
+                } else if (action == "com.example.screentranslator.SYNC") {
+                    syncUiState()
                 }
             }
         }
-        val filter = IntentFilter("com.example.screentranslator.EXIT")
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(exitReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(exitReceiver, filter)
+        val filter = IntentFilter()
+        filter.addAction("com.example.screentranslator.EXIT")
+        filter.addAction("com.example.screentranslator.SYNC")
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(receiver, filter)
+            }
+        } catch (e: Exception) { }
+    }
+
+    private fun refreshMetrics() {
+        try {
+            val wm = windowManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && wm != null) {
+                val bounds = wm.currentWindowMetrics.bounds
+                screenWidth = bounds.width()
+                screenHeight = bounds.height()
+            } else {
+                val dm = resources.displayMetrics
+                screenWidth = dm.widthPixels
+                screenHeight = dm.heightPixels
+            }
+        } catch (e: Exception) {
+            val dm = resources.displayMetrics
+            screenWidth = dm.widthPixels
+            screenHeight = dm.heightPixels
+        }
+        if (screenWidth < 1) screenWidth = 1
+        if (screenHeight < 1) screenHeight = 1
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        refreshMetrics()
+        clearOverlay()
+        val p = buttonParams
+        if (p != null) {
+            if (p.x > screenWidth - buttonSize) p.x = screenWidth - buttonSize
+            if (p.y > screenHeight - buttonSize) p.y = screenHeight - buttonSize
+            if (p.x < 0) p.x = 0
+            if (p.y < 0) p.y = 0
+            try {
+                buttonView?.let { windowManager?.updateViewLayout(it, p) }
+            } catch (e: Exception) { }
         }
     }
 
@@ -215,12 +279,15 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private fun hideOverlayIfShowing() {
         if (!isOverlayShowing) return
-        val since = System.currentTimeMillis() - overlayShownAt
-        if (since < 1000) return
+        if (System.currentTimeMillis() - overlayShownAt < 1200) return
+        clearOverlay()
+        setButtonColor("#2196F3")
+    }
+
+    private fun clearOverlay() {
         overlayView?.setEntries(emptyList())
         overlayView?.visibility = View.INVISIBLE
         isOverlayShowing = false
-        setButtonColor("#2196F3")
     }
 
     private fun syncUiState() {
@@ -229,24 +296,21 @@ class TranslatorAccessibilityService : AccessibilityService() {
             .getBoolean("uiOff", false)
         if (off) {
             buttonView?.visibility = View.GONE
-            overlayView?.visibility = View.INVISIBLE
-            isOverlayShowing = false
+            clearOverlay()
         } else {
-            buttonView?.visibility = View.VISIBLE
+            if (!isWorking) buttonView?.visibility = View.VISIBLE
         }
     }
 
     private fun setupOverlay() {
-        overlayView = OverlayView(this).apply {
-            visibility = View.INVISIBLE
-        }
-        val params = android.view.WindowManager.LayoutParams(
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        overlayView = OverlayView(this).apply { visibility = View.INVISIBLE }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
@@ -261,17 +325,17 @@ class TranslatorAccessibilityService : AccessibilityService() {
         buttonView = TextView(this).apply {
             text = getString(R.string.button_label)
             setTextColor(Color.WHITE)
-            textSize = 14f
+            textSize = 16f
             gravity = Gravity.CENTER
             background = buttonBg
         }
 
-        buttonSize = dpToPx(44)
-        buttonParams = android.view.WindowManager.LayoutParams(
+        buttonSize = dpToPx(46)
+        buttonParams = WindowManager.LayoutParams(
             buttonSize, buttonSize,
-            android.view.WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         )
         buttonParams?.gravity = Gravity.TOP or Gravity.START
@@ -328,9 +392,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     MotionEvent.ACTION_UP -> {
                         handler.removeCallbacks(longPressRunnable)
                         val dt = System.currentTimeMillis() - downTime
-                        if (!moved && dt < 500) {
-                            onButtonTap()
-                        }
+                        if (!moved && dt < 600) onButtonTap()
+                        return true
+                    }
+                    MotionEvent.ACTION_CANCEL -> {
+                        handler.removeCallbacks(longPressRunnable)
                         return true
                     }
                 }
@@ -342,9 +408,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun onButtonTap() {
         if (isWorking) return
         if (isOverlayShowing) {
-            overlayView?.setEntries(emptyList())
-            overlayView?.visibility = View.INVISIBLE
-            isOverlayShowing = false
+            clearOverlay()
             setButtonColor("#2196F3")
         } else {
             translateNow()
@@ -355,43 +419,69 @@ class TranslatorAccessibilityService : AccessibilityService() {
         isWorking = true
         setButtonColor("#FF9800")
         buttonView?.visibility = View.GONE
-        overlayView?.setEntries(emptyList())
-        overlayView?.visibility = View.INVISIBLE
+        clearOverlay()
         handler.postDelayed({ collectAndTranslate() }, 250)
     }
 
-    private data class Item(val text: String, val rect: Rect)
-
     private fun collectAndTranslate() {
-        val root = rootInActiveWindow
+        refreshMetrics()
+        var root: AccessibilityNodeInfo? = null
+        try {
+            root = rootInActiveWindow
+        } catch (e: Exception) { }
+
         if (root == null) {
             resetWork()
-            Toast.makeText(this, getString(R.string.msg_no_screen), Toast.LENGTH_SHORT).show()
+            toast(getString(R.string.msg_no_screen))
             return
         }
-        if (root.packageName == packageName) {
+        if (root.packageName?.toString() == packageName) {
             resetWork()
-            Toast.makeText(this, getString(R.string.msg_own_app), Toast.LENGTH_LONG).show()
+            toast(getString(R.string.msg_own_app))
             return
         }
 
         val raw = ArrayList<Item>()
-        walk(root, raw)
+        try {
+            walk(root, raw, 0)
+        } catch (e: Exception) { }
 
         val noParents = filterParents(raw)
         val unique = dedupe(noParents)
-        val clean = resolveOverlaps(unique)
-        val items = if (clean.size > 40) clean.subList(0, 40) else clean
+        val packed = packRects(unique)
+        val items = if (packed.size > 40) packed.subList(0, 40) else packed
 
         if (items.isEmpty()) {
             resetWork()
-            Toast.makeText(this, getString(R.string.msg_no_text), Toast.LENGTH_SHORT).show()
+            toast(getString(R.string.msg_no_text))
             return
         }
 
         buttonView?.visibility = View.VISIBLE
         val finalItems = ArrayList<Item>(items)
         Thread { callWithRotation(finalItems) }.start()
+    }
+
+    private fun walk(node: AccessibilityNodeInfo, items: ArrayList<Item>, depth: Int) {
+        if (items.size >= 140 || depth > 60) return
+        try {
+            val t = node.text?.toString()?.trim()
+            if (!t.isNullOrBlank() && t.length > 1 && node.isVisibleToUser) {
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                val screen = Rect(0, 0, screenWidth, screenHeight)
+                if (r.intersect(screen) && r.width() >= minBoxWidth && r.height() >= minBoxHeight) {
+                    var clean = t.replace(CHAR_NL, ' ').replace(CHAR_CR, ' ').trim()
+                    if (clean.length > 600) clean = clean.substring(0, 600)
+                    if (clean.length > 1) items.add(Item(clean, r))
+                }
+            }
+            val count = node.childCount
+            for (i in 0 until count) {
+                val child = node.getChild(i)
+                if (child != null) walk(child, items, depth + 1)
+            }
+        } catch (e: Exception) { }
     }
 
     private fun filterParents(raw: List<Item>): List<Item> {
@@ -424,6 +514,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     duplicate = true
                     break
                 }
+                if (old.text == item.text && overlapPercent(item.rect, old.rect) > 60) {
+                    duplicate = true
+                    break
+                }
             }
             if (!duplicate) out.add(item)
         }
@@ -442,66 +536,58 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return ((inter * 100L) / area).toInt()
     }
 
-    private fun resolveOverlaps(list: List<Item>): List<Item> {
-        val bySize = list.sortedBy { it.rect.width().toLong() * it.rect.height().toLong() }
-        val accepted = ArrayList<Item>()
+    private fun packRects(list: List<Item>): List<Item> {
+        val bySize = list.sortedWith(Comparator { a, b ->
+            val areaA = a.rect.width().toLong() * a.rect.height().toLong()
+            val areaB = b.rect.width().toLong() * b.rect.height().toLong()
+            if (areaA < areaB) -1 else if (areaA > areaB) 1 else 0
+        })
+
+        val placed = ArrayList<Item>()
         for (cand in bySize) {
-            var keep = true
-            for (old in accepted) {
-                if (overlapPercent(cand.rect, old.rect) > 25) {
-                    keep = false
+            val r = Rect(cand.rect)
+            var ok = true
+            var guard = 0
+            while (guard < 40) {
+                guard++
+                var hit: Rect? = null
+                for (p in placed) {
+                    if (Rect.intersects(r, p.rect)) {
+                        hit = p.rect
+                        break
+                    }
+                }
+                if (hit == null) break
+
+                val ox = Math.min(r.right, hit.right) - Math.max(r.left, hit.left)
+                val oy = Math.min(r.bottom, hit.bottom) - Math.max(r.top, hit.top)
+                if (oy <= ox) {
+                    if (r.centerY() >= hit.centerY()) r.top = hit.bottom else r.bottom = hit.top
+                } else {
+                    if (r.centerX() >= hit.centerX()) r.left = hit.right else r.right = hit.left
+                }
+                if (r.width() < minBoxWidth || r.height() < minBoxHeight) {
+                    ok = false
                     break
                 }
             }
-            if (keep) accepted.add(cand)
-        }
+            if (!ok) continue
+            if (r.width() < minBoxWidth || r.height() < minBoxHeight) continue
 
-        val ordered = accepted.sortedWith(Comparator { a, b ->
-            if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
-        })
-        return separate(ordered)
-    }
-
-    private fun separate(list: List<Item>): List<Item> {
-        val out = ArrayList<Item>()
-        for (item in list) {
-            val r = Rect(item.rect)
-            for (old in out) {
-                if (r.right <= old.rect.left || r.left >= old.rect.right) continue
-                if (r.top >= old.rect.bottom || r.bottom <= old.rect.top) continue
-                if (r.top >= old.rect.top) {
-                    r.top = old.rect.bottom
-                } else {
-                    r.bottom = old.rect.top
+            var clash = false
+            for (p in placed) {
+                if (Rect.intersects(r, p.rect)) {
+                    clash = true
+                    break
                 }
             }
-            if (r.width() > 0 && r.height() >= minBoxHeight) {
-                out.add(Item(item.text, r))
-            }
+            if (clash) continue
+            placed.add(Item(cand.text, r))
         }
-        return out
-    }
 
-    private fun walk(node: AccessibilityNodeInfo, items: ArrayList<Item>) {
-        if (items.size >= 150) return
-        val t = node.text?.toString()?.trim()
-        if (!t.isNullOrBlank() && t.length > 1 && node.isVisibleToUser) {
-            val r = Rect()
-            node.getBoundsInScreen(r)
-            val screen = Rect(0, 0, screenWidth, screenHeight)
-            if (r.intersect(screen) && r.width() > 0 && r.height() >= minBoxHeight) {
-                var clean = t.replace(CHAR_NL, ' ')
-                if (clean.length > 700) clean = clean.substring(0, 700)
-                items.add(Item(clean, r))
-            }
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i)
-            if (child != null) {
-                walk(child, items)
-                child.recycle()
-            }
-        }
+        return placed.sortedWith(Comparator { a, b ->
+            if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
+        })
     }
 
     private fun callWithRotation(items: List<Item>) {
@@ -509,10 +595,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val models = getModels()
 
         if (keys.isEmpty() || models.isEmpty()) {
+            saveError(getString(R.string.msg_no_key))
             handler.post {
                 resetWork()
-                saveError(getString(R.string.msg_no_key))
-                Toast.makeText(this, getString(R.string.msg_no_key), Toast.LENGTH_SHORT).show()
+                toast(getString(R.string.msg_no_key))
             }
             return
         }
@@ -524,8 +610,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
         var lastCode = 0
 
         while (attempts < totalCombos && resultText == null) {
-            val key = keys[currentKeyIndex]
-            val model = models[currentModelIndex]
+            val key = keys[currentKeyIndex % keys.size]
+            val model = models[currentModelIndex % models.size]
             saveCurrentCombo(key, model)
             val result = callGeminiText(key, model, prompt)
             if (result.first != null) {
@@ -534,25 +620,24 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 lastCode = result.second
                 moveToNextCombo(keys.size, models.size)
                 attempts++
-                Thread.sleep(300)
+                try {
+                    Thread.sleep(300)
+                } catch (e: Exception) { }
             }
         }
 
         if (resultText != null) {
             val finalText = resultText
+            saveError("")
             handler.post {
                 showOverlay(finalText, items)
-                isOverlayShowing = true
-                overlayShownAt = System.currentTimeMillis()
                 isWorking = false
-                setButtonColor("#4CAF50")
-                saveError("")
             }
         } else {
             saveError("HTTP " + lastCode)
             handler.post {
                 resetWork()
-                Toast.makeText(this, getString(R.string.msg_failed), Toast.LENGTH_LONG).show()
+                toast(getString(R.string.msg_failed))
             }
         }
     }
@@ -560,14 +645,15 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun buildPrompt(items: List<Item>): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("তুমি একজন দক্ষ অনুবাদক। নিচের লাইনগুলো একটি মোবাইল স্ক্রিনের লেখা।").append(nl)
-        sb.append("প্রতিটি লাইনকে সহজ ও স্বাভাবিক বাংলায় অনুবাদ করো।").append(nl)
-        sb.append("নিয়ম: সংখ্যা, সময়, নাম, ইমেইল, লিংক, কোড ও ইউজারনেম অপরিবর্তিত রাখবে।").append(nl)
-        sb.append("অনুবাদ যতটা সম্ভব ছোট রাখবে, কারণ মূল লেখার জায়গাতেই দেখানো হবে।").append(nl)
-        sb.append("লেখা আগে থেকেই বাংলা হলে সেটি হুবহু ফেরত দেবে।").append(nl)
-        sb.append("উত্তর হবে শুধুমাত্র valid JSON: translations নামে একটি array, ")
-        sb.append("প্রতিটি item এ id এবং translated_text থাকবে।").append(nl)
-        sb.append("id হবে নিচের লাইনের নম্বর। JSON ছাড়া অন্য কোনো লেখা দেবে না।").append(nl)
+        sb.append("তুমি একজন দক্ষ অনুবাদক। নিচের নম্বর দেওয়া লেখাগুলো যেকোনো ভাষা থেকে সহজ ও স্বাভাবিক বাংলায় অনুবাদ করো।").append(nl)
+        sb.append("নিয়মগুলো মানবে:").append(nl)
+        sb.append("১) প্রতিটি নম্বরের জন্য আলাদা অনুবাদ দেবে, নম্বর হুবহু মিলিয়ে দেবে।").append(nl)
+        sb.append("২) সংখ্যা, সময়, তারিখ, ইমোজি, ইউজারনেম, লিংক ও ব্র্যান্ডের নাম অপরিবর্তিত রাখবে।").append(nl)
+        sb.append("৩) লেখা আগেই বাংলা হলে হুবহু সেটাই ফেরত দেবে।").append(nl)
+        sb.append("৪) অনুবাদ যতটা সম্ভব ছোট রাখবে, মূল লেখার চেয়ে বড় করবে না।").append(nl)
+        sb.append("৫) কোনো ব্যাখ্যা, মন্তব্য বা মার্কডাউন দেবে না।").append(nl)
+        sb.append("শুধু এই গঠনে JSON দেবে: translations নামের একটি array, প্রতিটি item এ id (সংখ্যা) এবং translated_text (string)।").append(nl)
+        sb.append("লেখাগুলো:").append(nl)
         for (i in items.indices) {
             sb.append(i + 1).append(". ").append(items[i].text).append(nl)
         }
@@ -580,20 +666,20 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 put("contents", JSONArray().apply {
                     put(JSONObject().apply {
                         put("parts", JSONArray().apply {
-                            put(JSONObject().apply {
-                                put("text", prompt)
-                            })
+                            put(JSONObject().apply { put("text", prompt) })
                         })
                     })
                 })
+                put("generationConfig", JSONObject().apply {
+                    put("temperature", 0.2)
+                    put("responseMimeType", "application/json")
+                })
             }
 
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/" +
+                    model + ":generateContent?key=" + key
             val requestBody = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder()
-                .url(url)
-                .post(requestBody)
-                .build()
+            val request = Request.Builder().url(url).post(requestBody).build()
 
             val response = client.newCall(request).execute()
             val code = response.code
@@ -602,20 +688,26 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
             if (code == 200 && body != null) {
                 val jsonResponse = JSONObject(body)
-                val candidates = jsonResponse.getJSONArray("candidates")
-                if (candidates.length() > 0) {
-                    val content = candidates.getJSONObject(0).getJSONObject("content")
-                    val parts = content.getJSONArray("parts")
-                    if (parts.length() > 0) {
-                        var text = parts.getJSONObject(0).getString("text")
+                val candidates = jsonResponse.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val content = candidates.getJSONObject(0).optJSONObject("content")
+                    val parts = content?.optJSONArray("parts")
+                    if (parts != null) {
+                        val sb = StringBuilder()
+                        for (i in 0 until parts.length()) {
+                            val part = parts.optJSONObject(i) ?: continue
+                            if (part.optBoolean("thought", false)) continue
+                            val piece = part.optString("text", "")
+                            if (piece.isNotBlank()) sb.append(piece)
+                        }
+                        var text = sb.toString()
                         val s = text.indexOf('{')
                         val e = text.lastIndexOf('}')
-                        if (s >= 0 && e > s) {
-                            text = text.substring(s, e + 1)
-                        }
-                        return Pair(text, 200)
+                        if (s >= 0 && e > s) text = text.substring(s, e + 1)
+                        if (text.isNotBlank()) return Pair(text, 200)
                     }
                 }
+                return Pair(null, 204)
             }
             return Pair(null, code)
         } catch (e: Exception) {
@@ -626,7 +718,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun showOverlay(responseText: String, items: List<Item>) {
         try {
             val json = JSONObject(responseText)
-            val translations = json.getJSONArray("translations")
+            val translations = json.optJSONArray("translations")
+            if (translations == null) {
+                resetWork()
+                toast(getString(R.string.msg_failed))
+                return
+            }
 
             val byId = HashMap<Int, String>()
             for (i in 0 until translations.length()) {
@@ -650,21 +747,40 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     }
                 }
                 if (translated.isNullOrBlank()) continue
-                if (translated == items[i].text) continue
-                entries.add(OverlayView.Entry(translated, items[i].text, items[i].rect))
+                val clean = translated.replace(CHAR_NL, ' ').replace(CHAR_CR, ' ').trim()
+                if (clean.isBlank()) continue
+                if (clean == items[i].text) continue
+                entries.add(OverlayView.Entry(clean, items[i].rect))
+            }
+
+            if (entries.isEmpty()) {
+                resetWork()
+                toast(getString(R.string.msg_no_text))
+                return
             }
 
             overlayView?.setEntries(entries)
             overlayView?.visibility = View.VISIBLE
+            isOverlayShowing = true
+            overlayShownAt = System.currentTimeMillis()
+            buttonView?.visibility = View.VISIBLE
+            setButtonColor("#4CAF50")
         } catch (e: Exception) {
-            e.printStackTrace()
+            resetWork()
+            toast(getString(R.string.msg_failed))
         }
     }
 
     private fun resetWork() {
         isWorking = false
-        buttonView?.visibility = View.VISIBLE
         setButtonColor("#2196F3")
+        syncUiState()
+    }
+
+    private fun toast(msg: String) {
+        try {
+            Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { }
     }
 
     private fun saveError(msg: String) {
@@ -673,7 +789,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun setButtonColor(hex: String) {
-        buttonBg?.setColor(Color.parseColor(hex))
+        try {
+            buttonBg?.setColor(Color.parseColor(hex))
+        } catch (e: Exception) { }
     }
 
     private fun dpToPx(dp: Int): Int {
@@ -719,34 +837,48 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun shutdown() {
         uiReady = false
         removeViews()
+        unregister()
         try {
-            exitReceiver?.let { unregisterReceiver(it) }
+            disableSelf()
         } catch (e: Exception) { }
-        exitReceiver = null
-        disableSelf()
+    }
+
+    private fun unregister() {
+        try {
+            receiver?.let { unregisterReceiver(it) }
+        } catch (e: Exception) { }
+        receiver = null
     }
 
     private fun removeViews() {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
         try {
-            buttonView?.let { wm.removeView(it) }
+            buttonView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) { }
         try {
-            overlayView?.let { wm.removeView(it) }
+            overlayView?.let { windowManager?.removeView(it) }
         } catch (e: Exception) { }
         buttonView = null
         overlayView = null
     }
 
-    override fun onDestroy() {
+    override fun onUnbind(intent: Intent?): Boolean {
+        uiReady = false
+        handler.removeCallbacksAndMessages(null)
         removeViews()
-        try {
-            exitReceiver?.let { unregisterReceiver(it) }
-        } catch (e: Exception) { }
+        unregister()
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        uiReady = false
+        handler.removeCallbacksAndMessages(null)
+        removeViews()
+        unregister()
         super.onDestroy()
     }
 
     companion object {
         private val CHAR_NL = Char(10)
+        private val CHAR_CR = Char(13)
     }
 }
