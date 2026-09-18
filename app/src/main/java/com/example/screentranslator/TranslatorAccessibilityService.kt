@@ -30,7 +30,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 class OverlayView : View {
-    data class Entry(val text: String, val rect: Rect)
+    data class Entry(val text: String, val orig: String, val rect: Rect)
 
     private var entries: List<Entry> = emptyList()
     private val bgPaint = Paint().apply { color = Color.argb(235, 20, 20, 20) }
@@ -59,6 +59,7 @@ class OverlayView : View {
             offY = loc[1]
             resolved = true
         }
+        val cap = 20f * resources.displayMetrics.density
         for (en in entries) {
             val l = en.rect.left.toFloat() - offX - 2f
             val t = en.rect.top.toFloat() - offY - 2f
@@ -70,11 +71,18 @@ class OverlayView : View {
 
             canvas.drawRect(l, t, r, b, bgPaint)
 
-            textPaint.textSize = h * 0.7f
-            var lines = wrap(en.text, textPaint, w - 8f)
+            val usableW = w - 8f
+            textPaint.textSize = cap
+            val linesOrig = wrap(en.orig, textPaint, usableW).size
+            val est = h / (linesOrig * 1.25f)
+            var size = if (cap < est) cap else est
+            if (size < 10f) size = 10f
+            textPaint.textSize = size
+
+            var lines = wrap(en.text, textPaint, usableW)
             while (lines.size * textPaint.textSize * 1.25f > h && textPaint.textSize > 9f) {
                 textPaint.textSize = textPaint.textSize - 2f
-                lines = wrap(en.text, textPaint, w - 8f)
+                lines = wrap(en.text, textPaint, usableW)
             }
 
             val totalH = lines.size * textPaint.textSize * 1.25f
@@ -166,12 +174,24 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+        val type = event?.eventType ?: return
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            type == AccessibilityEvent.TYPE_VIEW_SCROLLED
+        ) {
+            hideOverlayIfShowing()
             syncUiState()
         }
     }
 
     override fun onInterrupt() { }
+
+    private fun hideOverlayIfShowing() {
+        if (isOverlayShowing) {
+            overlayView?.visibility = View.INVISIBLE
+            isOverlayShowing = false
+            setButtonColor("#2196F3")
+        }
+    }
 
     private fun syncUiState() {
         if (!uiReady) return
@@ -324,8 +344,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
             return
         }
 
-        val items = ArrayList<Item>()
-        walk(root, items)
+        val raw = ArrayList<Item>()
+        walk(root, raw)
+        val items = filterParents(raw)
 
         if (items.isEmpty()) {
             resetWork()
@@ -335,6 +356,27 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
         buttonView?.visibility = View.VISIBLE
         Thread { callWithRotation(items) }.start()
+    }
+
+    private fun filterParents(raw: List<Item>): List<Item> {
+        val result = ArrayList<Item>()
+        for (a in raw) {
+            var isParent = false
+            val aFlat = a.text.replace(" ", "")
+            for (b in raw) {
+                if (a === b) continue
+                if (a.rect.width() >= b.rect.width() && a.rect.height() > b.rect.height()
+                    && a.rect.contains(b.rect)
+                    && aFlat.contains(b.text.replace(" ", ""))
+                    && a.text.length > b.text.length
+                ) {
+                    isParent = true
+                    break
+                }
+            }
+            if (!isParent) result.add(a)
+        }
+        return result
     }
 
     private fun walk(node: AccessibilityNodeInfo, items: ArrayList<Item>) {
@@ -504,7 +546,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 }
                 if (translated.isNullOrBlank()) continue
                 if (translated == items[i].text) continue
-                entries.add(OverlayView.Entry(translated, items[i].rect))
+                entries.add(OverlayView.Entry(translated, items[i].text, items[i].rect))
             }
 
             overlayView?.setEntries(entries)
