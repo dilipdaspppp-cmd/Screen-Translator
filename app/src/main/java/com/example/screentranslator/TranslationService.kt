@@ -11,6 +11,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.drawable.GradientDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.ImageReader
@@ -22,8 +23,9 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Base64
 import android.view.Gravity
-import android.widget.FrameLayout
+import android.view.View
 import android.widget.ImageView
+import android.widget.TextView
 import android.widget.Toast
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -38,14 +40,17 @@ class TranslationService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
-    private var overlayView: FrameLayout? = null
     private var overlayImage: ImageView? = null
+    private var buttonView: TextView? = null
+    private var buttonBg: GradientDrawable? = null
     private val handler = Handler(Looper.getMainLooper())
-    private var isRunning = false
     private var currentKeyIndex = 0
     private var currentModelIndex = 0
     private var screenWidth = 1
     private var screenHeight = 1
+    private var isCapturing = false
+    private var isOverlayShowing = false
+    private var serviceOn = false
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -60,10 +65,18 @@ class TranslationService : Service() {
         createNotificationChannel()
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Translator")
-            .setContentText("অনুবাদ চলছে...")
+            .setContentText("ফ্লোটিং বাটন চালু আছে")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .build()
         startForeground(NOTIFICATION_ID, notification)
+
+        val metrics = resources.displayMetrics
+        screenWidth = metrics.widthPixels
+        screenHeight = metrics.heightPixels
+
+        setupOverlayImage()
+        setupFloatingButton()
+        serviceOn = true
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -71,48 +84,79 @@ class TranslationService : Service() {
             "START_TRANSLATION" -> {
                 val resultCode = intent.getIntExtra("resultCode", -1)
                 val data = intent.getParcelableExtra<Intent>("data")
-                if (resultCode != -1 && data != null) {
-                    startCapture(resultCode, data)
+                if (resultCode != -1 && data != null && mediaProjection == null) {
+                    initProjection(resultCode, data)
+                    Toast.makeText(this, "ফ্লোটিং বাটন এসেছে! যে কোনো অ্যাপে গিয়ে বাটনে চাপুন", Toast.LENGTH_LONG).show()
                 }
             }
             "STOP_TRANSLATION" -> {
-                stopCapture()
-                stopSelf()
+                stopAll()
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun startCapture(resultCode: Int, data: Intent) {
-        val mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
+    private fun initProjection(resultCode: Int, data: Intent) {
+        val manager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = manager.getMediaProjection(resultCode, data)
 
         if (mediaProjection == null) {
             Toast.makeText(this, "MediaProjection শুরু করা যায়নি", Toast.LENGTH_SHORT).show()
-            stopSelf()
+            stopAll()
             return
         }
-
-        val metrics = resources.displayMetrics
-        screenWidth = metrics.widthPixels
-        screenHeight = metrics.heightPixels
-        val density = metrics.densityDpi
 
         imageReader = ImageReader.newInstance(screenWidth, screenHeight, PixelFormat.RGBA_8888, 2)
 
         virtualDisplay = mediaProjection?.createVirtualDisplay(
             "ScreenTranslator",
-            screenWidth, screenHeight, density,
+            screenWidth, screenHeight, resources.displayMetrics.densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader?.surface, null, null
         )
-
-        setupOverlay()
-        isRunning = true
-        handler.postDelayed(captureRunnable, 2500)
     }
 
-    private fun setupOverlay() {
+    private fun setupFloatingButton() {
+        buttonBg = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(Color.parseColor("#2196F3"))
+        }
+        buttonView = TextView(this).apply {
+            text = "অ"
+            setTextColor(Color.WHITE)
+            textSize = 24f
+            gravity = Gravity.CENTER
+            background = buttonBg
+        }
+
+        val size = dpToPx(60)
+        val params = android.view.WindowManager.LayoutParams(
+            size, size,
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        )
+        params.gravity = Gravity.TOP or Gravity.START
+        params.x = dpToPx(8)
+        params.y = screenHeight / 2
+
+        buttonView?.setOnClickListener { onButtonTap() }
+        buttonView?.setOnLongClickListener {
+            Toast.makeText(this, "সার্ভিস বন্ধ হচ্ছে", Toast.LENGTH_SHORT).show()
+            stopAll()
+            true
+        }
+
+        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+        wm.addView(buttonView, params)
+    }
+
+    private fun setupOverlayImage() {
+        overlayImage = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_XY
+            visibility = View.INVISIBLE
+        }
         val params = android.view.WindowManager.LayoutParams(
             android.view.WindowManager.LayoutParams.MATCH_PARENT,
             android.view.WindowManager.LayoutParams.MATCH_PARENT,
@@ -123,102 +167,109 @@ class TranslationService : Service() {
             PixelFormat.TRANSLUCENT
         )
         params.gravity = Gravity.TOP or Gravity.START
-        params.x = 0
-        params.y = 0
-
-        overlayView = FrameLayout(this)
-        overlayImage = ImageView(this)
-        overlayImage?.scaleType = ImageView.ScaleType.FIT_XY
-        overlayView?.addView(overlayImage)
-
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-        windowManager.addView(overlayView, params)
+        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+        wm.addView(overlayImage, params)
     }
 
-    private val captureRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) return
-
-            val image = imageReader?.acquireLatestImage()
-            if (image != null) {
-                val w = image.width
-                val h = image.height
-                val planes = image.planes
-                val buffer = planes[0].buffer
-                val pixelStride = planes[0].pixelStride
-                val rowStride = planes[0].rowStride
-                val rowPadding = rowStride - pixelStride * w
-
-                val bitmap = Bitmap.createBitmap(
-                    w + rowPadding / pixelStride,
-                    h,
-                    Bitmap.Config.ARGB_8888
-                )
-                bitmap.copyPixelsFromBuffer(buffer)
-                image.close()
-
-                val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, w, h)
-                translateImage(croppedBitmap)
-            } else {
-                handler.postDelayed(this, CAPTURE_INTERVAL)
-            }
+    private fun onButtonTap() {
+        if (isCapturing) return
+        if (isOverlayShowing) {
+            overlayImage?.visibility = View.INVISIBLE
+            isOverlayShowing = false
+            setButtonColor("#2196F3")
+        } else {
+            beginTranslation()
         }
     }
 
-    private fun translateImage(bitmap: Bitmap) {
-        Thread {
-            val keys = getKeys()
-            val models = getModels()
+    private fun beginTranslation() {
+        if (mediaProjection == null) {
+            Toast.makeText(this, "আগে মেইন অ্যাপ থেকে অনুবাদ শুরু করুন", Toast.LENGTH_LONG).show()
+            return
+        }
+        isCapturing = true
+        buttonView?.visibility = View.GONE
+        overlayImage?.visibility = View.INVISIBLE
+        handler.postDelayed({ captureNow(0) }, 900)
+    }
 
-            if (keys.isEmpty() || models.isEmpty()) {
-                handler.post {
-                    Toast.makeText(this, "সেটিংসে key বা model নেই", Toast.LENGTH_SHORT).show()
-                    stopCapture()
-                    stopSelf()
-                }
-                return@Thread
-            }
-
-            val totalCombos = keys.size * models.size
-            var attempts = 0
-            var success = false
-            var resultText: String? = null
-
-            while (attempts < totalCombos && !success) {
-                val key = keys[currentKeyIndex]
-                val model = models[currentModelIndex]
-
-                saveCurrentCombo(key, model)
-
-                val result = callGeminiAPI(key, model, bitmap)
-                if (result != null) {
-                    success = true
-                    resultText = result
-                } else {
-                    moveToNextCombo(keys.size, models.size)
-                    attempts++
-                    Thread.sleep(400)
-                }
-            }
-
-            if (success && resultText != null) {
-                val finalText = resultText
-                handler.post {
-                    updateOverlay(finalText)
-                    handler.postDelayed(captureRunnable, CAPTURE_INTERVAL)
-                }
+    private fun captureNow(retry: Int) {
+        val image = imageReader?.acquireLatestImage()
+        if (image == null) {
+            if (retry < 3) {
+                handler.postDelayed({ captureNow(retry + 1) }, 400)
             } else {
-                handler.post {
-                    Toast.makeText(this, "সব লিমিট শেষ, ১ মিনিট অপেক্ষা করছি...", Toast.LENGTH_LONG).show()
-                }
-                Thread.sleep(60000)
-                currentKeyIndex = 0
-                currentModelIndex = 0
-                handler.post {
-                    handler.postDelayed(captureRunnable, CAPTURE_INTERVAL)
-                }
+                isCapturing = false
+                buttonView?.visibility = View.VISIBLE
+                Toast.makeText(this, "স্ক্রিন ধরা যায়নি, আবার চেষ্টা করুন", Toast.LENGTH_SHORT).show()
             }
-        }.start()
+            return
+        }
+
+        val w = image.width
+        val h = image.height
+        val planes = image.planes
+        val buffer = planes[0].buffer
+        val pixelStride = planes[0].pixelStride
+        val rowStride = planes[0].rowStride
+        val rowPadding = rowStride - pixelStride * w
+
+        val full = Bitmap.createBitmap(w + rowPadding / pixelStride, h, Bitmap.Config.ARGB_8888)
+        full.copyPixelsFromBuffer(buffer)
+        image.close()
+        val bitmap = Bitmap.createBitmap(full, 0, 0, w, h)
+
+        buttonView?.visibility = View.VISIBLE
+        Thread { translateWithRotation(bitmap) }.start()
+    }
+
+    private fun translateWithRotation(bitmap: Bitmap) {
+        val keys = getKeys()
+        val models = getModels()
+
+        if (keys.isEmpty() || models.isEmpty()) {
+            handler.post {
+                Toast.makeText(this, "সেটিংসে key বা model নেই", Toast.LENGTH_SHORT).show()
+                isCapturing = false
+            }
+            return
+        }
+
+        val totalCombos = keys.size * models.size
+        var attempts = 0
+        var resultText: String? = null
+
+        while (attempts < totalCombos && resultText == null) {
+            val key = keys[currentKeyIndex]
+            val model = models[currentModelIndex]
+            saveCurrentCombo(key, model)
+            val result = callGeminiAPI(key, model, bitmap)
+            if (result != null) {
+                resultText = result
+            } else {
+                moveToNextCombo(keys.size, models.size)
+                attempts++
+                Thread.sleep(400)
+            }
+        }
+
+        if (resultText != null) {
+            val finalText = resultText
+            handler.post {
+                drawAndShowOverlay(finalText)
+                isOverlayShowing = true
+                isCapturing = false
+                setButtonColor("#4CAF50")
+            }
+        } else {
+            handler.post {
+                Toast.makeText(this, "সব লিমিট শেষ, ১ মিনিট পর আবার চেষ্টা করছি", Toast.LENGTH_LONG).show()
+            }
+            Thread.sleep(60000)
+            currentKeyIndex = 0
+            currentModelIndex = 0
+            handler.post { captureNow(0) }
+        }
     }
 
     private fun callGeminiAPI(key: String, model: String, bitmap: Bitmap): String? {
@@ -288,7 +339,7 @@ class TranslationService : Service() {
         return null
     }
 
-    private fun updateOverlay(responseText: String) {
+    private fun drawAndShowOverlay(responseText: String) {
         try {
             val json = JSONObject(responseText)
             val translations = json.getJSONArray("translations")
@@ -313,9 +364,7 @@ class TranslationService : Service() {
                 val boxWidth = right - left
                 val boxHeight = bottom - top
 
-                val bgPaint = Paint().apply {
-                    color = Color.argb(220, 20, 20, 20)
-                }
+                val bgPaint = Paint().apply { color = Color.argb(220, 20, 20, 20) }
                 canvas.drawRect(left, top, right, bottom, bgPaint)
 
                 val paint = Paint().apply {
@@ -326,15 +375,23 @@ class TranslationService : Service() {
                 while (paint.measureText(translatedText) > boxWidth && paint.textSize > 10f) {
                     paint.textSize = paint.textSize - 2f
                 }
-
                 val baseline = top + boxHeight / 2f - (paint.descent() + paint.ascent()) / 2f
                 canvas.drawText(translatedText, left + 4f, baseline, paint)
             }
 
             overlayImage?.setImageBitmap(bitmap)
+            overlayImage?.visibility = View.VISIBLE
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    private fun setButtonColor(hex: String) {
+        buttonBg?.setColor(Color.parseColor(hex))
+    }
+
+    private fun dpToPx(dp: Int): Int {
+        return (dp * resources.displayMetrics.density).toInt()
     }
 
     private fun getKeys(): List<String> {
@@ -373,21 +430,24 @@ class TranslationService : Service() {
         }
     }
 
-    private fun stopCapture() {
-        isRunning = false
-        handler.removeCallbacks(captureRunnable)
+    private fun stopAll() {
+        serviceOn = false
+        val wm = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+        try {
+            buttonView?.let { wm.removeView(it) }
+        } catch (e: Exception) { }
+        try {
+            overlayImage?.let { wm.removeView(it) }
+        } catch (e: Exception) { }
+        buttonView = null
+        overlayImage = null
         virtualDisplay?.release()
         virtualDisplay = null
         imageReader?.close()
         imageReader = null
         mediaProjection?.stop()
         mediaProjection = null
-
-        overlayView?.let {
-            val windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
-            windowManager.removeView(it)
-        }
-        overlayView = null
+        stopSelf()
     }
 
     private fun createNotificationChannel() {
@@ -403,13 +463,12 @@ class TranslationService : Service() {
     }
 
     override fun onDestroy() {
-        stopCapture()
+        if (serviceOn) stopAll()
         super.onDestroy()
     }
 
     companion object {
         private const val CHANNEL_ID = "ScreenTranslatorChannel"
         private const val NOTIFICATION_ID = 1
-        private const val CAPTURE_INTERVAL = 4000L
     }
 }
