@@ -38,7 +38,13 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class OverlayView(context: Context) : View(context) {
     class Entry(val text: String, val rect: Rect, val srcSize: Float, val maxLines: Int)
@@ -134,8 +140,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var windowManager: WindowManager? = null
     private val handler = Handler(Looper.getMainLooper())
     private val measurePaint = TextPaint()
-    private var currentKeyIndex = 0
-    private var currentModelIndex = 0
     private var screenWidth = 1
     private var screenHeight = 1
     private var isWorking = false
@@ -146,17 +150,51 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var minBoxWidth = 1
     private var uiReady = false
     private var receiver: BroadcastReceiver? = null
+
+    // key/model ঘোরানো, কুলডাউন, ক্যাশ ও প্যারালাল কাজের জন্য
+    private val comboLock = Any()
+    private var comboBase = 0
+    private val cooldown = HashMap<String, Long>()
+    private val noThinking = HashSet<String>()
+    private val session = AtomicInteger(0)
+    @Volatile private var pool: ExecutorService? = null
+    private val cache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
+            return size > CACHE_MAX
+        }
+    }
+
     private val longPressRunnable = Runnable {
         getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
             .putBoolean("uiOff", true).apply()
         syncUiState()
         toast(getString(R.string.msg_button_hidden))
     }
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+
+    private val textClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .callTimeout(40, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
+
+    private val imageClient = textClient.newBuilder()
+        .readTimeout(50, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(70, TimeUnit.SECONDS)
+        .build()
+
+    private fun getPool(): ExecutorService {
+        synchronized(comboLock) {
+            var p = pool
+            if (p == null || p.isShutdown) {
+                p = Executors.newFixedThreadPool(6)
+                pool = p
+            }
+            return p!!
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -399,13 +437,15 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private fun translateNow() {
         isWorking = true
+        session.incrementAndGet()
         setButtonColor(COLOR_BUSY)
         buttonView?.visibility = View.GONE
         clearOverlay()
-        handler.postDelayed({ collectAndTranslate() }, 220)
+        handler.post { collectAndTranslate() }
     }
 
     private fun collectAndTranslate() {
+        val mySession = session.get()
         refreshMetrics()
         var root: AccessibilityNodeInfo? = null
         try {
@@ -416,12 +456,21 @@ class TranslatorAccessibilityService : AccessibilityService() {
             toast(getString(R.string.msg_own_app))
             return
         }
+        val keys = getKeys()
+        val models = getModels()
+        if (keys.isEmpty() || models.isEmpty()) {
+            saveError(getString(R.string.msg_no_key))
+            resetWork()
+            toast(getString(R.string.msg_no_key))
+            return
+        }
         val raw = ArrayList<Item>()
         if (root != null) {
             try {
                 walk(root, raw, 0)
             } catch (e: Exception) { }
         }
+        val appPkg = try { root?.packageName?.toString() ?: "" } catch (e: Exception) { "" }
         val cleaned = dedupe(filterParents(raw))
         val limited = if (cleaned.size > MAX_ITEMS) cleaned.subList(0, MAX_ITEMS) else cleaned
         val items = ArrayList<Item>()
@@ -429,14 +478,29 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val s = limited[i]
             items.add(Item(s.text, Rect(s.rect), s.srcSize, false, i + 1))
         }
-        captureScreen { shot ->
-            if (items.isEmpty() && shot == null) {
-                resetWork()
-                toast(getString(R.string.msg_no_text))
-            } else {
-                startWork(items, shot)
-            }
+
+        // ক্যাশে থাকা লেখা সাথে সাথে নেওয়া হবে, বাকিগুলো এখনই প্যারালালে পাঠানো হবে
+        val map: MutableMap<Int, String> = ConcurrentHashMap()
+        val pending = ArrayList<Item>()
+        for (it0 in items) {
+            val c = cacheGet(it0.text)
+            if (c != null) map[it0.id] = c else pending.add(it0)
         }
+        val futures = submitChunks(pending, keys, models, map, appPkg, 0)
+
+        // বাটন লুকানোর জন্য সামান্য অপেক্ষা করে স্ক্রিনশট
+        handler.postDelayed({
+            captureScreen { shot ->
+                if (items.isEmpty() && shot == null) {
+                    resetWork()
+                    toast(getString(R.string.msg_no_text))
+                } else {
+                    buttonView?.visibility = View.VISIBLE
+                    setButtonColor(COLOR_BUSY)
+                    Thread { runJob(mySession, items, map, futures, shot, keys, models, appPkg) }.start()
+                }
+            }
+        }, 200)
     }
 
     private fun walk(node: AccessibilityNodeInfo, items: ArrayList<Item>, depth: Int) {
@@ -465,8 +529,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun stripEmojiTags(s: String): String {
-        // ইমোজির বর্গ-বন্ধনী বর্ণনা যেমন [玫瑰], [捂脸] বাদ দেওয়া হচ্ছে —
-        // এগুলো অনুবাদের তালিকায় কখনোই ঢুকবে না, স্ক্রিনেও দেখানো হবে না।
         var out = EMOJI_TAG_REGEX.replace(s, "")
         out = MULTI_SPACE_REGEX.replace(out, " ").trim()
         return out
@@ -573,8 +635,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         })
         val placed = ArrayList<Item>()
         for (cand in sorted) {
-            // মূল লেখা যত ছোট ছিল, বাক্সও ততটুকুই থাকবে — অনুবাদের জন্য বড় করা হবে না।
-            // লেখা না ধরলে ফন্ট সাইজ ছোট হবে (OverlayView.setEntries), বাক্স নয়।
             var size = cand.srcSize
             if (size > hardMax) size = hardMax
             val orig = cand.rect
@@ -704,117 +764,220 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun startWork(items: List<Item>, shot: String?) {
-        buttonView?.visibility = View.VISIBLE
-        setButtonColor(COLOR_BUSY)
-        val copy = ArrayList<Item>(items)
-        Thread { runJob(copy, shot) }.start()
+    private fun submitChunks(list: List<Item>, keys: List<String>, models: List<String>,
+                             out: MutableMap<Int, String>, appPkg: String, startOffset: Int): List<Future<Int>> {
+        val res = ArrayList<Future<Int>>()
+        var i = 0
+        var off = startOffset
+        while (i < list.size) {
+            var end = i + CHUNK
+            if (end > list.size) end = list.size
+            val chunk = ArrayList<Item>(list.subList(i, end))
+            val o = off
+            try {
+                res.add(getPool().submit(Callable<Int> { translateChunk(chunk, keys, models, out, appPkg, o) }))
+            } catch (e: Exception) { }
+            off++
+            i = end
+        }
+        return res
     }
 
-    private fun runJob(items: List<Item>, shot: String?) {
+    private fun waitAll(futures: List<Future<Int>>): Int {
+        var lastCode = 0
+        for (f in futures) {
+            val c = try {
+                f.get(90, TimeUnit.SECONDS)
+            } catch (e: Exception) {
+                -1
+            }
+            if (c != 200) lastCode = c
+        }
+        return lastCode
+    }
+
+    private fun runJob(mySession: Int, items: List<Item>, map: MutableMap<Int, String>,
+                       futures: List<Future<Int>>, shot: String?, keys: List<String>,
+                       models: List<String>, appPkg: String) {
         try {
-            val keys = getKeys()
-            val models = getModels()
-            if (keys.isEmpty() || models.isEmpty()) {
-                saveError(getString(R.string.msg_no_key))
-                handler.post {
-                    resetWork()
-                    toast(getString(R.string.msg_no_key))
-                }
-                return
-            }
-            val map = HashMap<Int, String>()
-            var lastCode = 0
-            if (items.isNotEmpty()) {
-                var i = 0
-                while (i < items.size) {
-                    var end = i + CHUNK
-                    if (end > items.size) end = items.size
-                    val code = translateChunk(items.subList(i, end), keys, models, map)
-                    if (code != 200) lastCode = code
-                    i = end
-                }
-                val missing = ArrayList<Item>()
-                for (it0 in items) {
-                    if (!map.containsKey(it0.id)) missing.add(it0)
-                }
-                if (missing.isNotEmpty() && missing.size <= 60) {
-                    var j = 0
-                    while (j < missing.size) {
-                        var end = j + CHUNK
-                        if (end > missing.size) end = missing.size
-                        translateChunk(missing.subList(j, end), keys, models, map)
-                        j = end
-                    }
-                }
-            }
-            val imageItems = ArrayList<Item>()
+            // ছবির অনুবাদ আলাদাভাবে একসাথে চলবে
+            var shotFuture: Future<List<Item>>? = null
             if (shot != null) {
-                imageItems.addAll(translateShot(shot, items, keys, models))
+                val shotOffset = futures.size
+                shotFuture = getPool().submit(Callable<List<Item>> {
+                    translateShot(shot, items, keys, models, shotOffset)
+                })
             }
-            val entries = ArrayList<Item>()
+
+            var lastCode = waitAll(futures)
+
+            val missing = ArrayList<Item>()
+            for (it0 in items) {
+                if (!map.containsKey(it0.id)) missing.add(it0)
+            }
+            if (missing.isNotEmpty() && missing.size <= 60) {
+                val retry = submitChunks(missing, keys, models, map, appPkg, 1)
+                val c = waitAll(retry)
+                if (c != 0) lastCode = c
+            }
+
+            val textEntries = ArrayList<Item>()
             for (it0 in items) {
                 val tr = map[it0.id] ?: continue
                 val clean = oneLine(tr)
                 if (clean.isBlank()) continue
+                cachePut(it0.text, clean)
                 if (squash(clean) == squash(it0.text)) continue
-                entries.add(Item(clean, Rect(it0.rect), it0.srcSize, false, it0.id))
+                textEntries.add(Item(clean, Rect(it0.rect), it0.srcSize, false, it0.id))
             }
-            var extraId = 500000
-            for (im in imageItems) {
-                var clash = false
-                for (e in entries) {
-                    if (overlapPercent(im.rect, e.rect) > 25) {
-                        clash = true
-                        break
-                    }
-                }
-                if (!clash) {
-                    entries.add(Item(im.text, Rect(im.rect), im.srcSize, true, extraId))
-                    extraId++
+
+            // লেখার অনুবাদ তৈরি হলেই সাথে সাথে দেখানো হবে
+            if (textEntries.isNotEmpty()) {
+                val firstDraw = toDraw(textEntries)
+                saveError("")
+                handler.post {
+                    if (session.get() == mySession) showOverlay(firstDraw)
                 }
             }
-            if (entries.isEmpty()) {
-                if (lastCode != 0 && lastCode != 200) {
-                    saveError("HTTP " + lastCode)
-                    handler.post {
-                        resetWork()
-                        toast(getString(R.string.msg_failed))
+
+            var imageItems: List<Item> = emptyList()
+            if (shotFuture != null) {
+                imageItems = try {
+                    shotFuture.get(90, TimeUnit.SECONDS)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+            }
+
+            if (textEntries.isEmpty()) {
+                if (imageItems.isEmpty()) {
+                    if (lastCode != 0 && lastCode != 200) {
+                        saveError("HTTP " + lastCode)
+                        handler.post {
+                            resetWork()
+                            toast(getString(R.string.msg_failed))
+                        }
+                    } else {
+                        saveError("")
+                        handler.post {
+                            resetWork()
+                            toast(getString(R.string.msg_no_text))
+                        }
                     }
-                } else {
-                    saveError("")
-                    handler.post {
-                        resetWork()
-                        toast(getString(R.string.msg_no_text))
-                    }
+                    return
+                }
+                val all = mergeImage(textEntries, imageItems)
+                val draw = toDraw(all)
+                saveError("")
+                handler.post {
+                    if (session.get() == mySession) showOverlay(draw)
                 }
                 return
             }
-            val laid = layoutBoxes(entries)
-            val drawList = ArrayList<OverlayView.Entry>()
-            for (e in laid) drawList.add(OverlayView.Entry(e.text, e.rect, e.srcSize, e.maxLines))
-            saveError("")
-            handler.post { showOverlay(drawList) }
+
+            if (imageItems.isNotEmpty()) {
+                val all = mergeImage(textEntries, imageItems)
+                if (all.size > textEntries.size) {
+                    val draw = toDraw(all)
+                    handler.post {
+                        if (session.get() == mySession && isOverlayShowing) {
+                            overlayView?.setEntries(draw)
+                        }
+                    }
+                }
+            }
         } catch (e: Exception) {
             handler.post {
-                resetWork()
-                toast(getString(R.string.msg_failed))
+                if (isWorking) {
+                    resetWork()
+                    toast(getString(R.string.msg_failed))
+                }
             }
         }
     }
 
-    private fun translateChunk(chunk: List<Item>, keys: List<String>, models: List<String>,
-                               out: HashMap<Int, String>): Int {
-        if (chunk.isEmpty()) return 200
-        val prompt = buildPrompt(chunk)
+    private fun mergeImage(textEntries: List<Item>, imageItems: List<Item>): List<Item> {
+        val entries = ArrayList<Item>(textEntries)
+        var extraId = 500000
+        for (im in imageItems) {
+            var clash = false
+            for (e in entries) {
+                if (overlapPercent(im.rect, e.rect) > 25) {
+                    clash = true
+                    break
+                }
+            }
+            if (!clash) {
+                entries.add(Item(im.text, Rect(im.rect), im.srcSize, true, extraId))
+                extraId++
+            }
+        }
+        return entries
+    }
+
+    private fun toDraw(list: List<Item>): List<OverlayView.Entry> {
+        val laid = layoutBoxes(list)
+        val drawList = ArrayList<OverlayView.Entry>()
+        for (e in laid) drawList.add(OverlayView.Entry(e.text, e.rect, e.srcSize, e.maxLines))
+        return drawList
+    }
+
+    private fun cacheGet(text: String): String? {
+        synchronized(cache) {
+            return cache[text]
+        }
+    }
+
+    private fun cachePut(text: String, tr: String) {
+        synchronized(cache) {
+            cache[text] = tr
+        }
+    }
+
+    // key-model জোড়ার ক্রম: কুলডাউনে থাকা জোড়া সবার শেষে
+    private fun comboOrder(keys: List<String>, models: List<String>, offset: Int): List<Int> {
         val total = keys.size * models.size
-        var attempts = 0
+        val now = System.currentTimeMillis()
+        val base = synchronized(comboLock) { ((comboBase % total) + total) % total }
+        val first = base + (offset % keys.size) * models.size
+        val ready = ArrayList<Int>()
+        val cooled = ArrayList<Int>()
+        for (i in 0 until total) {
+            val idx = (first + i) % total
+            val tag = keys[idx / models.size] + "|" + models[idx % models.size]
+            val until = synchronized(comboLock) { cooldown[tag] ?: 0L }
+            if (until > now) cooled.add(idx) else ready.add(idx)
+        }
+        ready.addAll(cooled)
+        return ready
+    }
+
+    private fun markBad(idx: Int, keys: List<String>, models: List<String>, code: Int) {
+        val total = keys.size * models.size
+        val tag = keys[idx / models.size] + "|" + models[idx % models.size]
+        val ms = when {
+            code == 429 -> 60000L
+            code == 400 || code == 401 || code == 403 || code == 404 -> 600000L
+            code >= 500 -> 15000L
+            else -> 20000L
+        }
+        synchronized(comboLock) {
+            cooldown[tag] = System.currentTimeMillis() + ms
+            if (((comboBase % total) + total) % total == idx) comboBase = (idx + 1) % total
+        }
+    }
+
+    private fun translateChunk(chunk: List<Item>, keys: List<String>, models: List<String>,
+                               out: MutableMap<Int, String>, appPkg: String, offset: Int): Int {
+        if (chunk.isEmpty()) return 200
+        val prompt = buildPrompt(chunk, appPkg)
+        val order = comboOrder(keys, models, offset)
         var lastCode = 0
-        while (attempts < total) {
-            val key = keys[currentKeyIndex % keys.size]
-            val model = models[currentModelIndex % models.size]
+        for (idx in order) {
+            val key = keys[idx / models.size]
+            val model = models[idx % models.size]
             saveCurrentCombo(key, model)
-            val res = callGemini(key, model, prompt, null)
+            val res = callGemini(key, model, prompt, null, TEXT_THINKING)
             val body = res.first
             if (body != null) {
                 val added = parseTranslations(body, chunk, out)
@@ -822,32 +985,33 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 lastCode = 204
             } else {
                 lastCode = res.second
+                markBad(idx, keys, models, res.second)
             }
-            moveToNextCombo(keys.size, models.size)
-            attempts++
-            try {
-                Thread.sleep(250)
-            } catch (e: Exception) { }
         }
         return lastCode
     }
 
-    private fun buildPrompt(chunk: List<Item>): String {
+    private fun buildPrompt(chunk: List<Item>, appPkg: String): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("তুমি একজন পেশাদার অনুবাদক। নিচের নম্বর দেওয়া প্রতিটি লাইনের বাংলা অনুবাদ দাও।").append(nl)
-        sb.append("নিয়ম:").append(nl)
-        sb.append("1) তালিকার প্রতিটি নম্বরের জন্য অবশ্যই একটি ফলাফল দিতে হবে, কিছু বাদ দেওয়া যাবে না।").append(nl)
-        sb.append("2) মোট ").append(chunk.size).append(" টি আইটেম আছে, তাই ঠিক ").append(chunk.size).append(" টি ফলাফল দাও।").append(nl)
-        sb.append("3) অনুবাদ ছোট রাখো কিন্তু মূল লেখার সম্পূর্ণ অর্থ থাকবে; মাঝপথে কাটবে না।").append(nl)
-        sb.append("4) নাম, ব্র্যান্ড, সংখ্যা, সময়, মডেল, লিংক, কোড অপরিবর্তিত রাখো।").append(nl)
-        sb.append("5) কোনো ব্যাখ্যা, নোট বা অতিরিক্ত লেখা দেবে না।").append(nl)
-        sb.append("6) লেখা ইতিমধ্যে বাংলা হলে হুবহু ফিরত দাও।").append(nl)
-        sb.append("7) প্রতিটি অনুবাদ অবশ্যই একটাই স্বাভাবিক, প্রবাহমান বাংলা বাক্য/বাক্যাংশ হতে হবে — কমা দিয়ে দিয়ে শব্দ বা টুকরো টুকরো অংশ সাজিয়ে একটা তালিকার মতো দেবে না।").append(nl)
-        sb.append("8) শব্দ ধরে ধরে আক্ষরিক (word-by-word/gloss) অনুবাদ করবে না; পুরো লাইনটার সামগ্রিক অর্থ আগে বোঝো, তারপর সেটাকে শুদ্ধ ও সহজ বাংলায় নতুন করে লেখো। উইঘুর, আরবি বা অন্য যেকোনো ভাষার জন্যও এই একই নিয়ম প্রযোজ্য।").append(nl)
-        sb.append("9) কোনো লাইনের ভেতরে বর্গ বন্ধনীর ভেতরে চিহ্ন/অক্ষর থাকলে (যেমন [xx]) সেটা উপেক্ষা করবে, অনুবাদ করবে না, আউটপুটেও রাখবে না।").append(nl)
-        sb.append("শুধু এই JSON ফরম্যাটে উত্তর দাও: {translations:[{id:1,translated_text:বাংলা}]}").append(nl)
-        sb.append("লাইনের তালিকা:").append(nl)
+        sb.append("You are an expert Bengali localizer. Translate every numbered text below into natural, fluent, easy-to-read Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা), exactly the way a native Bengali speaker would naturally say or write it.").append(nl)
+        if (appPkg.isNotBlank()) {
+            sb.append("All texts come from the same phone screen of the app: ").append(appPkg).append(". Use the app and the other items as context to get the right meaning and tone.").append(nl)
+        } else {
+            sb.append("All texts come from the same phone screen. Use the other items as context to get the right meaning and tone.").append(nl)
+        }
+        sb.append("Rules:").append(nl)
+        sb.append("1) Translate the meaning, not word by word. Rephrase freely so it sounds smooth and natural in Bengali. Never give literal, awkward or machine-like Bengali.").append(nl)
+        sb.append("2) Use modern চলিত ভাষা, never সাধু ভাষা. Prefer simple everyday words people actually use over heavy or bookish words.").append(nl)
+        sb.append("3) Common tech/app words that Bengali speakers normally say in English should be written in Bengali script as spoken, e.g. লাইক, শেয়ার, কমেন্ট, সেটিংস, ডাউনলোড, লগইন, অ্যাপ, ভিডিও, অনলাইন, পোস্ট, প্রোফাইল.").append(nl)
+        sb.append("4) Keep names of people, brands, usernames (@...), hashtags, URLs, emails, numbers, prices, dates, codes and emojis exactly as they are.").append(nl)
+        sb.append("5) Buttons, menus, tabs and short labels: keep them short and clear (1-3 words). Sentences, messages and comments: translate fully with correct Bengali grammar and the দাঁড়ি (।).").append(nl)
+        sb.append("6) Keep the original tone (friendly, formal, funny, emotional). Translate slang and idioms into natural Bengali equivalents. Address the reader as আপনি.").append(nl)
+        sb.append("7) Good examples: You're all caught up = আপনি সব দেখে ফেলেছেন; What's on your mind? = আপনি কী ভাবছেন?; Swipe up to see more = আরও দেখতে উপরে সোয়াইপ করুন; Not now = এখন না; Something went wrong = কিছু একটা সমস্যা হয়েছে.").append(nl)
+        sb.append("8) Each numbered item is separate: do not merge, split or skip items. If an item is already Bengali or cannot be translated, return it unchanged.").append(nl)
+        sb.append("9) Return exactly ").append(chunk.size).append(" items with ids 1 to ").append(chunk.size).append(".").append(nl)
+        sb.append("Output only JSON, no explanation: {\"translations\":[{\"id\":1,\"translated_text\":\"...\"}]}").append(nl)
+        sb.append("Texts:").append(nl)
         for (i in chunk.indices) {
             sb.append(i + 1).append(". ").append(chunk[i].text).append(nl)
         }
@@ -857,18 +1021,19 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun buildShotPrompt(known: List<Item>, full: Boolean): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("এটি একটি মোবাইল স্ক্রিনের ছবি। ছবিটি ভালোভাবে দেখো।").append(nl)
+        sb.append("This is a phone screenshot.").append(nl)
         if (full) {
-            sb.append("ছবিতে যত লেখা দেখা যায়, সব লেখার বাংলা অনুবাদ দাও।").append(nl)
+            sb.append("Find all English or other non-Bengali text anywhere on the screen.").append(nl)
         } else {
-            sb.append("শুধু সেই লেখাগুলোর বাংলা দাও যেগুলো ছবি, পোস্টার, লোগো, থাম্বনেইল বা গ্রাফিক্সের ভেতরে আঁকা আছে।").append(nl)
+            sb.append("Find only English or other non-Bengali text that appears inside images, photos, video frames, banners, memes, posters or stylized graphics (not normal app UI text).").append(nl)
         }
-        sb.append("প্রতিটি লাইনের জন্য তার অবস্থান box_2d আকারে দাও, মান হবে [ymin,xmin,ymax,xmax] এবং 0 থেকে 1000 এর মধ্যে স্বাভাবিককৃত।").append(nl)
-        sb.append("বক্সটি শুধু লেখার চারপাশে থাকবে, পুরো ছবি নয়।").append(nl)
-        sb.append("সর্বোচ্চ 22 টি আইটেম দাও। সংখ্যা, ঘড়ির সময়, ব্যাটারি বা সিস্টেম আইকনের লেখা বাদ দাও।").append(nl)
-        sb.append("কোনো ব্যাখ্যা দেবে না। শুধু এই JSON দাও: {items:[{translated_text:বাংলা,box_2d:[0,0,0,0]}]}").append(nl)
+        sb.append("Translate it into natural, fluent Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা): translate the meaning, not word by word, so it reads like a native Bengali speaker wrote it.").append(nl)
+        sb.append("Group words that belong together (one line, one sentence or one paragraph block) into a single item.").append(nl)
+        sb.append("For each item give box_2d as [ymin, xmin, ymax, xmax], normalized from 0 to 1000, tightly covering the original text.").append(nl)
+        sb.append("Keep names, brands, numbers, URLs and usernames unchanged. Skip text that is already Bengali. Return at most 22 items.").append(nl)
+        sb.append("Output only JSON, no explanation: {\"items\":[{\"translated_text\":\"...\",\"box_2d\":[0,0,0,0]}]}").append(nl)
         if (known.isNotEmpty()) {
-            sb.append("নিচের লাইনগুলো ইতিমধ্যে অনুবাদ হয়েছে, এগুলো আবার দেবে না:").append(nl)
+            sb.append("These texts are already translated separately, skip them:").append(nl)
             var count = 0
             for (k in known) {
                 if (count >= 40) break
@@ -882,28 +1047,38 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun translateShot(b64: String, known: List<Item>, keys: List<String>,
-                              models: List<String>): List<Item> {
+                              models: List<String>, offset: Int): List<Item> {
         val full = known.size < 4
         val prompt = buildShotPrompt(known, full)
-        val total = keys.size * models.size
-        var attempts = 0
-        while (attempts < total) {
-            val key = keys[currentKeyIndex % keys.size]
-            val model = models[currentModelIndex % models.size]
+        val order = comboOrder(keys, models, offset)
+        for (idx in order) {
+            val key = keys[idx / models.size]
+            val model = models[idx % models.size]
             saveCurrentCombo(key, model)
-            val res = callGemini(key, model, prompt, b64)
+            val res = callGemini(key, model, prompt, b64, SHOT_THINKING)
             val body = res.first
             if (body != null) return parseShot(body)
-            moveToNextCombo(keys.size, models.size)
-            attempts++
-            try {
-                Thread.sleep(250)
-            } catch (e: Exception) { }
+            markBad(idx, keys, models, res.second)
         }
         return ArrayList()
     }
 
-    private fun callGemini(key: String, model: String, prompt: String, imageB64: String?): Pair<String?, Int> {
+    // thinkingLevel কম রাখলে উত্তর অনেক দ্রুত আসে; কোনো মডেল না মানলে সেটিং ছাড়াই আবার চেষ্টা
+    private fun callGemini(key: String, model: String, prompt: String, imageB64: String?, level: String): Pair<String?, Int> {
+        val skip = synchronized(comboLock) { noThinking.contains(model) }
+        if (skip) return rawCall(key, model, prompt, imageB64, null)
+        val first = rawCall(key, model, prompt, imageB64, level)
+        if (first.second == 400) {
+            val second = rawCall(key, model, prompt, imageB64, null)
+            if (second.second == 200 || second.second == 204) {
+                synchronized(comboLock) { noThinking.add(model) }
+            }
+            return second
+        }
+        return first
+    }
+
+    private fun rawCall(key: String, model: String, prompt: String, imageB64: String?, level: String?): Pair<String?, Int> {
         try {
             val parts = JSONArray()
             if (imageB64 != null) {
@@ -923,42 +1098,50 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val contents = JSONArray()
             contents.put(content)
             val gen = JSONObject()
-            gen.put("temperature", 0.1)
             gen.put("maxOutputTokens", 8192)
             gen.put("responseMimeType", "application/json")
+            if (level != null) {
+                val tc = JSONObject()
+                tc.put("thinkingLevel", level)
+                gen.put("thinkingConfig", tc)
+            }
             val json = JSONObject()
             json.put("contents", contents)
             json.put("generationConfig", gen)
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/" +
-                    model + ":generateContent?key=" + key
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
             val requestBody = json.toString().toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url(url).post(requestBody).build()
-            val response = client.newCall(request).execute()
-            val code = response.code
-            val body = response.body?.string()
-            response.close()
-            if (code == 200 && body != null) {
-                val jsonResponse = JSONObject(body)
-                val candidates = jsonResponse.optJSONArray("candidates")
-                if (candidates != null && candidates.length() > 0) {
-                    val cand = candidates.optJSONObject(0)
-                    val contentOut = cand?.optJSONObject("content")
-                    val outParts = contentOut?.optJSONArray("parts")
-                    if (outParts != null) {
-                        val sb = StringBuilder()
-                        for (i in 0 until outParts.length()) {
-                            val part = outParts.optJSONObject(i) ?: continue
-                            if (part.optBoolean("thought", false)) continue
-                            val piece = part.optString("text", "")
-                            if (piece.isNotBlank()) sb.append(piece)
+            val request = Request.Builder()
+                .url(url)
+                .header("x-goog-api-key", key)
+                .post(requestBody)
+                .build()
+            val c = if (imageB64 != null) imageClient else textClient
+            c.newCall(request).execute().use { response ->
+                val code = response.code
+                val body = response.body?.string()
+                if (code == 200 && body != null) {
+                    val jsonResponse = JSONObject(body)
+                    val candidates = jsonResponse.optJSONArray("candidates")
+                    if (candidates != null && candidates.length() > 0) {
+                        val cand = candidates.optJSONObject(0)
+                        val contentOut = cand?.optJSONObject("content")
+                        val outParts = contentOut?.optJSONArray("parts")
+                        if (outParts != null) {
+                            val sb = StringBuilder()
+                            for (i in 0 until outParts.length()) {
+                                val part = outParts.optJSONObject(i) ?: continue
+                                if (part.optBoolean("thought", false)) continue
+                                val piece = part.optString("text", "")
+                                if (piece.isNotBlank()) sb.append(piece)
+                            }
+                            val text = sb.toString()
+                            if (text.isNotBlank()) return Pair(text, 200)
                         }
-                        val text = sb.toString()
-                        if (text.isNotBlank()) return Pair(text, 200)
                     }
+                    return Pair(null, 204)
                 }
-                return Pair(null, 204)
+                return Pair(null, code)
             }
-            return Pair(null, code)
         } catch (e: Exception) {
             return Pair(null, -1)
         }
@@ -990,7 +1173,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return t
     }
 
-    private fun parseTranslations(body: String, chunk: List<Item>, out: HashMap<Int, String>): Int {
+    private fun parseTranslations(body: String, chunk: List<Item>, out: MutableMap<Int, String>): Int {
         var added = 0
         var arr: JSONArray? = null
         try {
@@ -1035,7 +1218,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return added
     }
 
-    private fun regexRescue(body: String, chunk: List<Item>, out: HashMap<Int, String>): Int {
+    private fun regexRescue(body: String, chunk: List<Item>, out: MutableMap<Int, String>): Int {
         var added = 0
         try {
             val rx = Regex("\"id\"\\s*:\\s*(\\d+)[\\s\\S]{0,60}?\"translated_text\"\\s*:\\s*\"([^\"]*)\"")
@@ -1173,14 +1356,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun moveToNextCombo(keyCount: Int, modelCount: Int) {
-        currentModelIndex++
-        if (currentModelIndex >= modelCount) {
-            currentModelIndex = 0
-            currentKeyIndex = (currentKeyIndex + 1) % keyCount
-        }
-    }
-
     private fun shutdown() {
         uiReady = false
         removeViews()
@@ -1221,6 +1396,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         removeViews()
         unregister()
+        try {
+            pool?.shutdownNow()
+        } catch (e: Exception) { }
+        pool = null
         super.onDestroy()
     }
 
@@ -1231,8 +1410,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private val MULTI_SPACE_REGEX = Regex("\\s{2,}")
         private const val MAX_NODES = 400
         private const val MAX_ITEMS = 100
-        private const val CHUNK = 30
+        private const val CHUNK = 25
         private const val BOX_MAX_LINES = 6
+        private const val CACHE_MAX = 800
+        private const val TEXT_THINKING = "minimal"
+        private const val SHOT_THINKING = "low"
         private const val COLOR_IDLE = "#2196F3"
         private const val COLOR_BUSY = "#FF9800"
         private const val COLOR_DONE = "#4CAF50"
