@@ -483,7 +483,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val easy = ArrayList<Item>()
         val hardItems = ArrayList<Item>()
         for (p in pending) {
-            if (isHardText(p.text)) hardItems.add(p) else easy.add(p)
+            if (isDeepText(p.text)) hardItems.add(p) else easy.add(p)
         }
         val size = pickChunk(easy.size, par)
         val futures = ArrayList<Future<Int>>()
@@ -520,7 +520,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
             if (t != null) {
                 var clean = t.replace(CHAR_NL, ' ').replace(CHAR_CR, ' ').trim()
                 clean = stripEmojiTags(clean)
-                if (clean.isNotEmpty() && node.isVisibleToUser && hasTranslatable(clean) && !isLoneLatin(clean)) {
+                if (clean.isNotEmpty() && node.isVisibleToUser && hasTranslatable(clean) && !isLiteral(clean) && !isLoneLatin(clean)) {
                     if (clean.length > 1200) clean = clean.substring(0, 1200)
                     val r = Rect()
                     node.getBoundsInScreen(r)
@@ -601,18 +601,56 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return false
     }
 
+    private fun isUrlToken(tok: String): Boolean {
+        if (tok.contains("http") || tok.contains("www.")) return true
+        val at = tok.indexOf('@')
+        return at > 0 && tok.indexOf('.', at) > at
+    }
+
+    private fun withoutUrls(s: String): String {
+        val sb = StringBuilder()
+        for (tok in s.split(' ')) {
+            if (tok.isEmpty() || isUrlToken(tok)) continue
+            if (sb.isNotEmpty()) sb.append(' ')
+            sb.append(tok)
+        }
+        return sb.toString()
+    }
+
     private fun isLiteral(s: String): Boolean {
-        val t = s.trim()
-        if (t.startsWith("@") || t.startsWith("#")) return true
-        if (t.contains("http") || t.contains("www.")) return true
-        if (t.contains("@") && t.contains(".") && !t.contains(" ")) return true
-        return false
+        return !hasTranslatable(withoutUrls(s))
+    }
+
+    private fun foreignLeft(t: String): Boolean {
+        val body = withoutUrls(t)
+        var bn = 0
+        var latin = 0
+        for (ch in body) {
+            if (!Character.isLetter(ch)) continue
+            val c = ch.code
+            if (c >= 0x0980 && c <= 0x09FF) {
+                bn++
+            } else if (c < 0x0250) {
+                latin++
+            } else {
+                return true
+            }
+        }
+        return latin * 3 > bn
     }
 
     private fun goodTr(src: String, tr: String): Boolean {
         val t = tr.trim()
         if (t.isEmpty()) return false
         if (isLiteral(src)) return true
+        if (squash(t) == squash(src)) return false
+        if (!hasBengali(t)) return false
+        return !foreignLeft(t)
+    }
+
+    private fun softOk(src: String, tr: String): Boolean {
+        val t = tr.trim()
+        if (t.isEmpty()) return false
         if (squash(t) == squash(src)) return false
         return hasBengali(t)
     }
@@ -695,6 +733,28 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private fun isHardText(s: String): Boolean {
         return scriptClass(s) >= 4
+    }
+
+    private fun isDeepText(s: String): Boolean {
+        val c = scriptClass(s)
+        if (c >= 4) return true
+        if (c in 1..3 && s.length <= 8) return true
+        return false
+    }
+
+    private fun hasDeep(list: List<Item>): Boolean {
+        for (x in list) {
+            if (isDeepText(x.text)) return true
+        }
+        return false
+    }
+
+    private fun hasHan(list: List<Item>): Boolean {
+        for (x in list) {
+            val c = scriptClass(x.text)
+            if (c == 1 || c == 2) return true
+        }
+        return false
     }
 
     private fun hasHard(list: List<Item>): Boolean {
@@ -963,11 +1023,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun buildTextEntries(items: List<Item>, map: Map<Int, String>): List<Item> {
         val list = ArrayList<Item>()
         for (it0 in items) {
-            val tr = map[it0.id] ?: continue
+            val good = map[it0.id]
+            val tr = good ?: map[-it0.id] ?: continue
             val clean = oneLine(tr)
             if (clean.isBlank()) continue
             if (squash(clean) == squash(it0.text)) continue
-            cachePut(it0.text, clean)
+            if (good != null) cachePut(it0.text, clean)
             list.add(Item(clean, Rect(it0.rect), it0.srcSize, false, it0.id))
         }
         return list
@@ -987,17 +1048,43 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun redrawNow(mySession: Int, lock: Any,
+                          textRef: java.util.concurrent.atomic.AtomicReference<List<Item>>,
+                          imageRef: java.util.concurrent.atomic.AtomicReference<List<Item>>): Boolean {
+        var result = false
+        synchronized(lock) {
+            val texts = textRef.get()
+            val images = imageRef.get()
+            val all = if (images.isEmpty()) texts else mergeImage(texts, images)
+            if (all.isNotEmpty()) {
+                postDraw(mySession, toDraw(all))
+                result = true
+            }
+        }
+        return result
+    }
+
     private fun runJob(mySession: Int, exec: ExecutorService, items: List<Item>,
                        map: MutableMap<Int, String>, futures: List<Future<Int>>, shot: String?,
                        keys: List<String>, models: List<String>, appPkg: String) {
-        var shown = false
+        val textRef = java.util.concurrent.atomic.AtomicReference<List<Item>>(emptyList())
+        val imageRef = java.util.concurrent.atomic.AtomicReference<List<Item>>(emptyList())
+        val shownFlag = java.util.concurrent.atomic.AtomicBoolean(false)
+        val drawLock = Any()
         var lastCode = 0
         try {
-            var shotFuture: Future<List<Item>>? = null
+            var shotFuture: Future<Int>? = null
             if (shot != null) {
                 val so = futures.size
                 shotFuture = try {
-                    exec.submit(Callable<List<Item>> { translateShot(shot, items, keys, models, so) })
+                    exec.submit(Callable<Int> {
+                        val res = translateShot(shot, items, keys, models, so)
+                        imageRef.set(res)
+                        if (res.isNotEmpty()) {
+                            if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
+                        }
+                        200
+                    })
                 } catch (e: Exception) {
                     null
                 }
@@ -1006,63 +1093,61 @@ class TranslatorAccessibilityService : AccessibilityService() {
             lastCode = waitAll(futures)
 
             var textEntries = buildTextEntries(items, map)
+            textRef.set(textEntries)
             if (textEntries.isNotEmpty()) {
                 saveError("")
-                postDraw(mySession, toDraw(textEntries))
-                shown = true
+                if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
             }
 
             var round = 0
             while (round < 2) {
                 val redo = ArrayList<Item>()
                 for (it0 in items) {
-                    val tr = map[it0.id]
-                    if (tr == null || !goodTr(it0.text, oneLine(tr))) redo.add(it0)
+                    if (map[it0.id] == null) redo.add(it0)
                 }
                 if (redo.isEmpty()) break
                 val fix: MutableMap<Int, String> = ConcurrentHashMap()
                 val sz = if (round == 0) RETRY_CHUNK else RETRY_CHUNK_2
                 val c = waitAll(submitChunks(exec, redo, sz, keys, models, fix, appPkg, round + 1, true))
                 if (c != 0 && textEntries.isEmpty()) lastCode = c
-                var improved = false
+                var changed = false
                 for (it0 in redo) {
-                    val v = fix[it0.id] ?: continue
-                    val clean = oneLine(v)
-                    if (clean.isBlank()) continue
-                    if (goodTr(it0.text, clean)) {
-                        map[it0.id] = clean
-                        improved = true
+                    val v = fix[it0.id]
+                    if (v != null) {
+                        val clean = oneLine(v)
+                        if (clean.isNotBlank()) {
+                            map[it0.id] = clean
+                            changed = true
+                        }
+                    } else {
+                        val sv = fix[-it0.id]
+                        if (sv != null) {
+                            val cleanSoft = oneLine(sv)
+                            if (cleanSoft.isNotBlank()) {
+                                map[-it0.id] = cleanSoft
+                                changed = true
+                            }
+                        }
                     }
                 }
-                if (improved) {
+                if (changed) {
                     textEntries = buildTextEntries(items, map)
+                    textRef.set(textEntries)
                     if (textEntries.isNotEmpty()) {
                         saveError("")
-                        postDraw(mySession, toDraw(textEntries))
-                        shown = true
+                        if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
                     }
                 }
                 round++
             }
 
-            var imageItems: List<Item> = emptyList()
             if (shotFuture != null) {
-                imageItems = try {
+                try {
                     shotFuture.get(100, TimeUnit.SECONDS)
-                } catch (e: Exception) {
-                    emptyList()
-                }
-            }
-            if (imageItems.isNotEmpty()) {
-                val all = mergeImage(textEntries, imageItems)
-                if (all.size > textEntries.size) {
-                    saveError("")
-                    postDraw(mySession, toDraw(all))
-                    shown = true
-                }
+                } catch (e: Exception) { }
             }
 
-            if (!shown) {
+            if (!shownFlag.get()) {
                 if (lastCode != 0 && lastCode != 200) {
                     saveError("HTTP " + lastCode)
                     handler.post {
@@ -1082,7 +1167,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 }
             }
         } catch (e: Exception) {
-            if (!shown) {
+            if (!shownFlag.get()) {
                 handler.post {
                     if (session.get() == mySession) {
                         resetWork()
@@ -1180,9 +1265,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
         for (idx in order) {
             val key = keys[idx / models.size]
             val model = models[idx % models.size]
-            val hard = hasHard(remaining)
-            val prompt = buildPrompt(remaining, appPkg, force, hard)
-            val level = if (hard || force) HARD_THINKING else TEXT_THINKING
+            val deep = force || hasDeep(remaining)
+            val prompt = buildPrompt(remaining, appPkg, force)
+            val level = if (deep) HARD_THINKING else TEXT_THINKING
             saveCurrentCombo(key, model)
             val res = callGemini(key, model, prompt, null, level)
             val body = res.first
@@ -1195,6 +1280,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     if (v != null && goodTr(it0.text, v)) {
                         out[it0.id] = v
                     } else {
+                        if (v != null && softOk(it0.text, v)) out[-it0.id] = v
                         still.add(it0)
                     }
                 }
@@ -1216,31 +1302,49 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return Char(34).toString() + s + Char(34)
     }
 
-    private fun buildPrompt(chunk: List<Item>, appPkg: String, force: Boolean, hard: Boolean): String {
+    private fun limitOf(x: Item): Int {
+        val w = (x.rect.width() - 4).toFloat()
+        val h = x.rect.height().toFloat()
+        val sz = if (x.srcSize < 1f) 1f else x.srcSize
+        var perLine = (w / (sz * 0.55f)).toInt()
+        if (perLine < 1) perLine = 1
+        var lines = (h / (sz * 1.25f)).toInt()
+        if (lines < 1) lines = 1
+        var cap = perLine * lines
+        if (cap < 6) cap = 6
+        return cap
+    }
+
+    private fun buildPrompt(chunk: List<Item>, appPkg: String, force: Boolean): String {
         val nl = CHAR_NL.toString()
-        val deep = hard || force
+        val hard = hasHard(chunk)
+        val deep = force || hasDeep(chunk)
         val sb = StringBuilder()
         sb.append("You are an expert translator into Bengali (Bangla). Translate EVERY numbered text below into natural, fluent, easy Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা), the way a native Bengali speaker naturally says it.").append(nl)
         if (appPkg.isNotBlank()) {
             sb.append("All texts are from one phone screen of the app ").append(appPkg).append(". Use this and the other items as context.").append(nl)
         }
-        sb.append("Each line has the form: number | detected source language | text. The language was detected from the writing system, so read the text as that language. Latin means English or another Latin-script language (Turkish, Spanish, French, Indonesian and so on): recognise it yourself. Arabic-script means Arabic, Persian, Urdu, Kazakh or Kyrgyz: recognise it yourself from the letters.").append(nl)
+        sb.append("Each line has the form: number | detected source language | text. Some lines have an extra field such as: max 6 chars, placed before the text. That means the box on screen is small, so write the Bengali in about that many characters or fewer, using the shortest natural word (for example খুঁজুন instead of অনুসন্ধান), but never at the cost of a wrong meaning. The language was detected from the writing system, so read the text as that language. Latin means English or another Latin-script language (Turkish, Spanish, French, Indonesian and so on): recognise it yourself. Arabic-script means Arabic, Persian, Urdu, Kazakh or Kyrgyz: recognise it yourself from the letters.").append(nl)
         sb.append("Rules:").append(nl)
-        sb.append("1) Translate ALL items. Never skip any item, even if it is a single word or a single character. Never return the English or original text unchanged. Every output must be written in Bengali script.").append(nl)
-        sb.append("2) Very short texts (one character, one word, tab names, button names, badges, counters with a word) must be translated too, by their meaning in a phone app, e.g. 新 = নতুন; 赞 = লাইক; 关注 = ফলো করুন; 更多 = আরও; Home = হোম. Keep the Bengali as short as the original.").append(nl)
-        sb.append("3) Translate the meaning, not word by word, so it sounds smooth and natural. Use modern চলিত ভাষা with simple everyday words, never সাধু ভাষা.").append(nl)
-        sb.append("4) English words that Bengali people commonly use, and names of people, apps, brands and places, must be written in Bengali script, e.g. লাইক, শেয়ার, কমেন্ট, সেটিংস, ভিডিও, ইউটিউব, গুগল, ফেসবুক.").append(nl)
-        sb.append("5) Only URLs, emails, @usernames, #hashtags, numbers and emojis stay as they are, but translate all other words around them.").append(nl)
-        sb.append("6) Buttons and short labels: short and clear. Sentences: complete, correct Bengali grammar. Keep the original tone. Address the reader as আপনি.").append(nl)
-        sb.append("7) Examples: You're all caught up = আপনি সব দেখে ফেলেছেন; What's on your mind? = আপনি কী ভাবছেন?; Not now = এখন না; Something went wrong = কিছু একটা সমস্যা হয়েছে.").append(nl)
+        sb.append("1) EVERY letter, word and sentence in ANY language (Chinese, English, Uyghur, Arabic, Russian, Japanese, Korean, Hindi and all others) must be translated into Bengali. Nothing may be left in the original language. Never skip any item, even if it is a single word or a single character. Never return the original text unchanged. Every output must be written in Bengali script.").append(nl)
+        sb.append("2) These must NOT be changed and must stay exactly in their place: symbols and punctuation (# @ & ? ! : ; - _ / + and similar), emojis, all digits (keep 0-9 exactly as they are, never turn them into Bengali digits), URLs and email addresses.").append(nl)
+        sb.append("3) Hashtags: keep the # sign and translate the words after it into Bengali, with no space after the #, joining several words with an underscore. Example: #分享 = #শেয়ার. Mentions: keep the @ sign and write the name after it in Bengali script (by sound for names). Example: @Alex = @অ্যালেক্স.").append(nl)
+        sb.append("4) Very short texts (one character, one word, tab names, button names, badges, counters with a word) must be translated too, by their meaning in a phone app, e.g. 新 = নতুন; 赞 = লাইক; 关注 = ফলো করুন; 更多 = আরও; Home = হোম.").append(nl)
+        sb.append("5) Translate the meaning, not word by word, so it sounds smooth and natural. Use modern চলিত ভাষা with simple everyday words, never সাধু ভাষা.").append(nl)
+        sb.append("6) English words that Bengali people commonly use, and names of people, apps, brands and places, must be written in Bengali script, e.g. লাইক, শেয়ার, কমেন্ট, সেটিংস, ভিডিও, ইউটিউব, গুগল, ফেসবুক.").append(nl)
+        sb.append("7) Buttons and short labels: short and clear. Sentences: complete, correct Bengali grammar. Keep the original tone. Address the reader as আপনি.").append(nl)
+        sb.append("8) Examples: You're all caught up = আপনি সব দেখে ফেলেছেন; What's on your mind? = আপনি কী ভাবছেন?; Not now = এখন না; Something went wrong = কিছু একটা সমস্যা হয়েছে.").append(nl)
+        if (hasHan(chunk)) {
+            sb.append("Common app words: 推荐 = প্রস্তাবিত; 关注 = ফলো করুন; 同城 = কাছাকাছি; 商城 = শপ; 直播 = লাইভ; 朋友 = বন্ধু; 消息 = মেসেজ; 我 = আমি; 首页 = হোম; 搜索 = খুঁজুন; 评论 = কমেন্ট; 分享 = শেয়ার; 点赞 = লাইক; 收藏 = সংরক্ষণ; 更多 = আরও; 设置 = সেটিংস.").append(nl)
+        }
         if (hard) {
-            sb.append("8) SPECIAL CARE: some texts are in a low-resource language such as Uyghur (a Turkic language written in Arabic script with letters like ئ ې ۇ ۆ ۈ ڭ ە ۋ; it can also be Kazakh or Kyrgyz written in Arabic script). It is NOT Arabic, Persian or Urdu. Read every word carefully, understand the real meaning in context, and never invent words or give an unrelated translation. Uyghur examples: ئىزدەش = খোঁজা; تەڭشەك = সেটিংস; ئاساسىي بەت = হোম পেজ.").append(nl)
+            sb.append("SPECIAL CARE: some texts are in a low-resource language such as Uyghur (a Turkic language written in Arabic script with letters like ئ ې ۇ ۆ ۈ ڭ ە ۋ; it can also be Kazakh or Kyrgyz written in Arabic script). It is NOT Arabic, Persian or Urdu. Read every word carefully, understand the real meaning in context, and never invent words or give an unrelated translation. Uyghur examples: ئىزدەش = খোঁজা; تەڭشەك = সেটিংস; ئاساسىي بەت = হোম পেজ.").append(nl)
         }
         if (deep) {
             sb.append("For every item first write its short English meaning in the field e, then translate that meaning into Bengali in the field b.").append(nl)
         }
         if (force) {
-            sb.append("IMPORTANT: these items were wrongly left untranslated or translated badly before. Write every single one in correct Bengali script now.").append(nl)
+            sb.append("IMPORTANT: these items were wrongly left untranslated or only partly translated before. Translate every single word of each one into correct Bengali script now, so that no Chinese, English, Arabic or other foreign letters remain (only symbols, emojis, digits and URLs stay).").append(nl)
         }
         sb.append("Return exactly ").append(chunk.size).append(" items, i from 1 to ").append(chunk.size).append(", one item per numbered text.").append(nl)
         if (deep) {
@@ -1250,8 +1354,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         sb.append("Texts:").append(nl)
         for (i in chunk.indices) {
-            val t = chunk[i].text
-            sb.append(i + 1).append(" | ").append(langName(scriptClass(t))).append(" | ").append(t).append(nl)
+            val x = chunk[i]
+            sb.append(i + 1).append(" | ").append(langName(scriptClass(x.text))).append(" | ")
+            val lim = limitOf(x)
+            if (lim <= 16) sb.append("max ").append(lim).append(" chars | ")
+            sb.append(x.text).append(nl)
         }
         return sb.toString()
     }
@@ -1263,10 +1370,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
         if (full) {
             sb.append("Find all English or other non-Bengali text anywhere on the screen, including very small text and single words.").append(nl)
         } else {
-            sb.append("Find only English or other non-Bengali text that appears inside images, photos, video frames, banners, memes, posters or stylized graphics (not normal app UI text).").append(nl)
+            sb.append("Find only English or other non-Bengali text that appears inside images, photos, video frames, banners, watermarks, memes, posters or stylized graphics (not normal app UI text).").append(nl)
         }
         sb.append("Identify the language of each text carefully. For example Uyghur is written in Arabic script with letters like ئ ې ۇ ڭ ە ۋ and must not be confused with Arabic, Persian or Urdu. Understand the real meaning first, then translate it correctly.").append(nl)
-        sb.append("Translate each into natural, fluent Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা) by meaning, not word by word. Write everything in Bengali script.").append(nl)
+        sb.append("Translate each into natural, fluent Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা) by meaning, not word by word. Every letter and word of the text, in any language, must be written in Bengali script. Keep symbols (# @ & ? ! and similar), emojis, digits and numbers exactly as they are.").append(nl)
         sb.append("Group words that belong together (one line or one sentence block) into a single item.").append(nl)
         sb.append("For each item give box_2d as [ymin, xmin, ymax, xmax], normalized 0 to 1000, tightly covering the original text.").append(nl)
         sb.append("Skip text that is already Bengali. Return at most 30 items.").append(nl)
