@@ -151,13 +151,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private var uiReady = false
     private var receiver: BroadcastReceiver? = null
 
-    // key/model ঘোরানো, কুলডাউন, ক্যাশ ও প্যারালাল কাজের জন্য
     private val comboLock = Any()
     private var comboBase = 0
     private val cooldown = HashMap<String, Long>()
     private val noThinking = HashSet<String>()
     private val session = AtomicInteger(0)
-    @Volatile private var pool: ExecutorService? = null
     private val cache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
             return size > CACHE_MAX
@@ -173,28 +171,17 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private val textClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(40, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
-        .callTimeout(40, TimeUnit.SECONDS)
+        .callTimeout(50, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
 
     private val imageClient = textClient.newBuilder()
-        .readTimeout(50, TimeUnit.SECONDS)
+        .readTimeout(55, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .callTimeout(70, TimeUnit.SECONDS)
         .build()
-
-    private fun getPool(): ExecutorService {
-        synchronized(comboLock) {
-            var p = pool
-            if (p == null || p.isShutdown) {
-                p = Executors.newFixedThreadPool(6)
-                pool = p
-            }
-            return p!!
-        }
-    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -479,28 +466,41 @@ class TranslatorAccessibilityService : AccessibilityService() {
             items.add(Item(s.text, Rect(s.rect), s.srcSize, false, i + 1))
         }
 
-        // ক্যাশে থাকা লেখা সাথে সাথে নেওয়া হবে, বাকিগুলো এখনই প্যারালালে পাঠানো হবে
+        var par = keys.size * 2
+        if (par < 2) par = 2
+        if (par > 6) par = 6
+        val exec = Executors.newFixedThreadPool(par)
+
         val map: MutableMap<Int, String> = ConcurrentHashMap()
         val pending = ArrayList<Item>()
         for (it0 in items) {
             val c = cacheGet(it0.text)
             if (c != null) map[it0.id] = c else pending.add(it0)
         }
-        val futures = submitChunks(pending, keys, models, map, appPkg, 0)
+        val size = pickChunk(pending.size, par)
+        val futures = submitChunks(exec, pending, size, keys, models, map, appPkg, 0, false)
 
-        // বাটন লুকানোর জন্য সামান্য অপেক্ষা করে স্ক্রিনশট
         handler.postDelayed({
             captureScreen { shot ->
                 if (items.isEmpty() && shot == null) {
+                    try { exec.shutdownNow() } catch (e: Exception) { }
                     resetWork()
                     toast(getString(R.string.msg_no_text))
                 } else {
                     buttonView?.visibility = View.VISIBLE
                     setButtonColor(COLOR_BUSY)
-                    Thread { runJob(mySession, items, map, futures, shot, keys, models, appPkg) }.start()
+                    Thread { runJob(mySession, exec, items, map, futures, shot, keys, models, appPkg) }.start()
                 }
             }
         }, 200)
+    }
+
+    private fun pickChunk(n: Int, par: Int): Int {
+        if (n <= 0) return CHUNK_MIN
+        var s = (n + par - 1) / par
+        if (s < CHUNK_MIN) s = CHUNK_MIN
+        if (s > CHUNK_MAX) s = CHUNK_MAX
+        return s
     }
 
     private fun walk(node: AccessibilityNodeInfo, items: ArrayList<Item>, depth: Int) {
@@ -546,6 +546,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         if (letters == 0) return false
         return bengali * 100 / letters < 70
+    }
+
+    private fun isLiteral(s: String): Boolean {
+        val t = s.trim()
+        if (t.startsWith("@") || t.startsWith("#")) return true
+        if (t.contains("http") || t.contains("www.")) return true
+        if (t.contains("@") && t.contains(".") && !t.contains(" ")) return true
+        return false
     }
 
     private fun estimateSize(text: String, r: Rect): Float {
@@ -764,18 +772,19 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun submitChunks(list: List<Item>, keys: List<String>, models: List<String>,
-                             out: MutableMap<Int, String>, appPkg: String, startOffset: Int): List<Future<Int>> {
+    private fun submitChunks(exec: ExecutorService, list: List<Item>, size: Int, keys: List<String>,
+                             models: List<String>, out: MutableMap<Int, String>, appPkg: String,
+                             startOffset: Int, force: Boolean): List<Future<Int>> {
         val res = ArrayList<Future<Int>>()
         var i = 0
         var off = startOffset
         while (i < list.size) {
-            var end = i + CHUNK
+            var end = i + size
             if (end > list.size) end = list.size
             val chunk = ArrayList<Item>(list.subList(i, end))
             val o = off
             try {
-                res.add(getPool().submit(Callable<Int> { translateChunk(chunk, keys, models, out, appPkg, o) }))
+                res.add(exec.submit(Callable<Int> { translateChunk(chunk, keys, models, out, appPkg, o, force) }))
             } catch (e: Exception) { }
             off++
             i = end
@@ -787,7 +796,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         var lastCode = 0
         for (f in futures) {
             val c = try {
-                f.get(90, TimeUnit.SECONDS)
+                f.get(100, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 -1
             }
@@ -796,103 +805,140 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return lastCode
     }
 
-    private fun runJob(mySession: Int, items: List<Item>, map: MutableMap<Int, String>,
-                       futures: List<Future<Int>>, shot: String?, keys: List<String>,
-                       models: List<String>, appPkg: String) {
+    private fun buildTextEntries(items: List<Item>, map: Map<Int, String>): List<Item> {
+        val list = ArrayList<Item>()
+        for (it0 in items) {
+            val tr = map[it0.id] ?: continue
+            val clean = oneLine(tr)
+            if (clean.isBlank()) continue
+            if (squash(clean) == squash(it0.text)) continue
+            cachePut(it0.text, clean)
+            list.add(Item(clean, Rect(it0.rect), it0.srcSize, false, it0.id))
+        }
+        return list
+    }
+
+    private fun postDraw(mySession: Int, draw: List<OverlayView.Entry>) {
+        handler.post {
+            if (session.get() == mySession) {
+                if (isWorking) {
+                    showOverlay(draw)
+                } else if (isOverlayShowing) {
+                    try {
+                        overlayView?.setEntries(draw)
+                    } catch (e: Exception) { }
+                }
+            }
+        }
+    }
+
+    private fun runJob(mySession: Int, exec: ExecutorService, items: List<Item>,
+                       map: MutableMap<Int, String>, futures: List<Future<Int>>, shot: String?,
+                       keys: List<String>, models: List<String>, appPkg: String) {
+        var shown = false
+        var lastCode = 0
         try {
-            // ছবির অনুবাদ আলাদাভাবে একসাথে চলবে
             var shotFuture: Future<List<Item>>? = null
             if (shot != null) {
-                val shotOffset = futures.size
-                shotFuture = getPool().submit(Callable<List<Item>> {
-                    translateShot(shot, items, keys, models, shotOffset)
-                })
+                val so = futures.size
+                shotFuture = try {
+                    exec.submit(Callable<List<Item>> { translateShot(shot, items, keys, models, so) })
+                } catch (e: Exception) {
+                    null
+                }
             }
 
-            var lastCode = waitAll(futures)
+            lastCode = waitAll(futures)
 
-            val missing = ArrayList<Item>()
-            for (it0 in items) {
-                if (!map.containsKey(it0.id)) missing.add(it0)
-            }
-            if (missing.isNotEmpty() && missing.size <= 60) {
-                val retry = submitChunks(missing, keys, models, map, appPkg, 1)
-                val c = waitAll(retry)
-                if (c != 0) lastCode = c
-            }
-
-            val textEntries = ArrayList<Item>()
-            for (it0 in items) {
-                val tr = map[it0.id] ?: continue
-                val clean = oneLine(tr)
-                if (clean.isBlank()) continue
-                cachePut(it0.text, clean)
-                if (squash(clean) == squash(it0.text)) continue
-                textEntries.add(Item(clean, Rect(it0.rect), it0.srcSize, false, it0.id))
-            }
-
-            // লেখার অনুবাদ তৈরি হলেই সাথে সাথে দেখানো হবে
+            var textEntries = buildTextEntries(items, map)
             if (textEntries.isNotEmpty()) {
-                val firstDraw = toDraw(textEntries)
                 saveError("")
-                handler.post {
-                    if (session.get() == mySession) showOverlay(firstDraw)
+                postDraw(mySession, toDraw(textEntries))
+                shown = true
+            }
+
+            val redo = ArrayList<Item>()
+            for (it0 in items) {
+                val tr = map[it0.id]
+                if (tr == null || tr.isBlank()) {
+                    redo.add(it0)
+                } else if (squash(oneLine(tr)) == squash(it0.text) && !isLiteral(it0.text)) {
+                    redo.add(it0)
+                }
+            }
+            if (redo.isNotEmpty()) {
+                val fix: MutableMap<Int, String> = ConcurrentHashMap()
+                val c = waitAll(submitChunks(exec, redo, RETRY_CHUNK, keys, models, fix, appPkg, 1, true))
+                if (c != 0 && textEntries.isEmpty()) lastCode = c
+                var improved = false
+                for (it0 in redo) {
+                    val v = fix[it0.id] ?: continue
+                    val clean = oneLine(v)
+                    if (clean.isBlank()) continue
+                    if (squash(clean) != squash(it0.text)) {
+                        map[it0.id] = clean
+                        improved = true
+                    }
+                }
+                if (improved) {
+                    textEntries = buildTextEntries(items, map)
+                    if (textEntries.isNotEmpty()) {
+                        saveError("")
+                        postDraw(mySession, toDraw(textEntries))
+                        shown = true
+                    }
                 }
             }
 
             var imageItems: List<Item> = emptyList()
             if (shotFuture != null) {
                 imageItems = try {
-                    shotFuture.get(90, TimeUnit.SECONDS)
+                    shotFuture.get(100, TimeUnit.SECONDS)
                 } catch (e: Exception) {
                     emptyList()
                 }
             }
-
-            if (textEntries.isEmpty()) {
-                if (imageItems.isEmpty()) {
-                    if (lastCode != 0 && lastCode != 200) {
-                        saveError("HTTP " + lastCode)
-                        handler.post {
-                            resetWork()
-                            toast(getString(R.string.msg_failed))
-                        }
-                    } else {
-                        saveError("")
-                        handler.post {
-                            resetWork()
-                            toast(getString(R.string.msg_no_text))
-                        }
-                    }
-                    return
-                }
-                val all = mergeImage(textEntries, imageItems)
-                val draw = toDraw(all)
-                saveError("")
-                handler.post {
-                    if (session.get() == mySession) showOverlay(draw)
-                }
-                return
-            }
-
             if (imageItems.isNotEmpty()) {
                 val all = mergeImage(textEntries, imageItems)
                 if (all.size > textEntries.size) {
-                    val draw = toDraw(all)
+                    saveError("")
+                    postDraw(mySession, toDraw(all))
+                    shown = true
+                }
+            }
+
+            if (!shown) {
+                if (lastCode != 0 && lastCode != 200) {
+                    saveError("HTTP " + lastCode)
                     handler.post {
-                        if (session.get() == mySession && isOverlayShowing) {
-                            overlayView?.setEntries(draw)
+                        if (session.get() == mySession) {
+                            resetWork()
+                            toast(getString(R.string.msg_failed))
+                        }
+                    }
+                } else {
+                    saveError("")
+                    handler.post {
+                        if (session.get() == mySession) {
+                            resetWork()
+                            toast(getString(R.string.msg_no_text))
                         }
                     }
                 }
             }
         } catch (e: Exception) {
-            handler.post {
-                if (isWorking) {
-                    resetWork()
-                    toast(getString(R.string.msg_failed))
+            if (!shown) {
+                handler.post {
+                    if (session.get() == mySession) {
+                        resetWork()
+                        toast(getString(R.string.msg_failed))
+                    }
                 }
             }
+        } finally {
+            try {
+                exec.shutdown()
+            } catch (e: Exception) { }
         }
     }
 
@@ -929,12 +975,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun cachePut(text: String, tr: String) {
+        if (squash(text) == squash(tr)) return
         synchronized(cache) {
             cache[text] = tr
         }
     }
 
-    // key-model জোড়ার ক্রম: কুলডাউনে থাকা জোড়া সবার শেষে
     private fun comboOrder(keys: List<String>, models: List<String>, offset: Int): List<Int> {
         val total = keys.size * models.size
         val now = System.currentTimeMillis()
@@ -957,7 +1003,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val tag = keys[idx / models.size] + "|" + models[idx % models.size]
         val ms = when {
             code == 429 -> 60000L
-            code == 400 || code == 401 || code == 403 || code == 404 -> 600000L
+            code == 401 || code == 403 || code == 404 -> 600000L
             code >= 500 -> 15000L
             else -> 20000L
         }
@@ -968,9 +1014,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun translateChunk(chunk: List<Item>, keys: List<String>, models: List<String>,
-                               out: MutableMap<Int, String>, appPkg: String, offset: Int): Int {
+                               out: MutableMap<Int, String>, appPkg: String, offset: Int,
+                               force: Boolean): Int {
         if (chunk.isEmpty()) return 200
-        val prompt = buildPrompt(chunk, appPkg)
+        val prompt = buildPrompt(chunk, appPkg, force)
         val order = comboOrder(keys, models, offset)
         var lastCode = 0
         for (idx in order) {
@@ -991,26 +1038,25 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return lastCode
     }
 
-    private fun buildPrompt(chunk: List<Item>, appPkg: String): String {
+    private fun buildPrompt(chunk: List<Item>, appPkg: String, force: Boolean): String {
         val nl = CHAR_NL.toString()
         val sb = StringBuilder()
-        sb.append("You are an expert Bengali localizer. Translate every numbered text below into natural, fluent, easy-to-read Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা), exactly the way a native Bengali speaker would naturally say or write it.").append(nl)
+        sb.append("You are an expert Bengali translator. Translate EVERY numbered text below into natural, fluent, easy Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা), the way a native Bengali speaker naturally says it.").append(nl)
         if (appPkg.isNotBlank()) {
-            sb.append("All texts come from the same phone screen of the app: ").append(appPkg).append(". Use the app and the other items as context to get the right meaning and tone.").append(nl)
-        } else {
-            sb.append("All texts come from the same phone screen. Use the other items as context to get the right meaning and tone.").append(nl)
+            sb.append("All texts are from one phone screen of the app ").append(appPkg).append(". Use this and the other items as context.").append(nl)
         }
         sb.append("Rules:").append(nl)
-        sb.append("1) Translate the meaning, not word by word. Rephrase freely so it sounds smooth and natural in Bengali. Never give literal, awkward or machine-like Bengali.").append(nl)
-        sb.append("2) Use modern চলিত ভাষা, never সাধু ভাষা. Prefer simple everyday words people actually use over heavy or bookish words.").append(nl)
-        sb.append("3) Common tech/app words that Bengali speakers normally say in English should be written in Bengali script as spoken, e.g. লাইক, শেয়ার, কমেন্ট, সেটিংস, ডাউনলোড, লগইন, অ্যাপ, ভিডিও, অনলাইন, পোস্ট, প্রোফাইল.").append(nl)
-        sb.append("4) Keep names of people, brands, usernames (@...), hashtags, URLs, emails, numbers, prices, dates, codes and emojis exactly as they are.").append(nl)
-        sb.append("5) Buttons, menus, tabs and short labels: keep them short and clear (1-3 words). Sentences, messages and comments: translate fully with correct Bengali grammar and the দাঁড়ি (।).").append(nl)
-        sb.append("6) Keep the original tone (friendly, formal, funny, emotional). Translate slang and idioms into natural Bengali equivalents. Address the reader as আপনি.").append(nl)
-        sb.append("7) Good examples: You're all caught up = আপনি সব দেখে ফেলেছেন; What's on your mind? = আপনি কী ভাবছেন?; Swipe up to see more = আরও দেখতে উপরে সোয়াইপ করুন; Not now = এখন না; Something went wrong = কিছু একটা সমস্যা হয়েছে.").append(nl)
-        sb.append("8) Each numbered item is separate: do not merge, split or skip items. If an item is already Bengali or cannot be translated, return it unchanged.").append(nl)
-        sb.append("9) Return exactly ").append(chunk.size).append(" items with ids 1 to ").append(chunk.size).append(".").append(nl)
-        sb.append("Output only JSON, no explanation: {\"translations\":[{\"id\":1,\"translated_text\":\"...\"}]}").append(nl)
+        sb.append("1) Translate ALL items. Never skip any item. Never return the English or original text unchanged. Every output must be written in Bengali script.").append(nl)
+        sb.append("2) Translate the meaning, not word by word, so it sounds smooth and natural. Use modern চলিত ভাষা with simple everyday words, never সাধু ভাষা.").append(nl)
+        sb.append("3) English words that Bengali people commonly use, and names of people, apps, brands and places, must be written in Bengali script, e.g. লাইক, শেয়ার, কমেন্ট, সেটিংস, ভিডিও, ইউটিউব, গুগল, ফেসবুক.").append(nl)
+        sb.append("4) Only URLs, emails, @usernames, #hashtags, numbers and emojis stay as they are, but translate all other words around them.").append(nl)
+        sb.append("5) Buttons and short labels: short and clear. Sentences: complete, correct Bengali grammar. Keep the original tone. Address the reader as আপনি.").append(nl)
+        sb.append("6) Examples: You're all caught up = আপনি সব দেখে ফেলেছেন; What's on your mind? = আপনি কী ভাবছেন?; Not now = এখন না; Something went wrong = কিছু একটা সমস্যা হয়েছে.").append(nl)
+        if (force) {
+            sb.append("IMPORTANT: these items were wrongly left untranslated before. Write every single one in Bengali script now.").append(nl)
+        }
+        sb.append("Return exactly ").append(chunk.size).append(" items, i from 1 to ").append(chunk.size).append(", one item per numbered text.").append(nl)
+        sb.append("Output only compact JSON, nothing else: {\"t\":[{\"i\":1,\"b\":\"বাংলা অনুবাদ\"}]}").append(nl)
         sb.append("Texts:").append(nl)
         for (i in chunk.indices) {
             sb.append(i + 1).append(". ").append(chunk[i].text).append(nl)
@@ -1027,11 +1073,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
         } else {
             sb.append("Find only English or other non-Bengali text that appears inside images, photos, video frames, banners, memes, posters or stylized graphics (not normal app UI text).").append(nl)
         }
-        sb.append("Translate it into natural, fluent Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা): translate the meaning, not word by word, so it reads like a native Bengali speaker wrote it.").append(nl)
-        sb.append("Group words that belong together (one line, one sentence or one paragraph block) into a single item.").append(nl)
-        sb.append("For each item give box_2d as [ymin, xmin, ymax, xmax], normalized from 0 to 1000, tightly covering the original text.").append(nl)
-        sb.append("Keep names, brands, numbers, URLs and usernames unchanged. Skip text that is already Bengali. Return at most 22 items.").append(nl)
-        sb.append("Output only JSON, no explanation: {\"items\":[{\"translated_text\":\"...\",\"box_2d\":[0,0,0,0]}]}").append(nl)
+        sb.append("Translate each into natural, fluent Bengali (প্রাঞ্জল, সহজ, চলিত বাংলা) by meaning, not word by word. Write everything in Bengali script.").append(nl)
+        sb.append("Group words that belong together (one line or one sentence block) into a single item.").append(nl)
+        sb.append("For each item give box_2d as [ymin, xmin, ymax, xmax], normalized 0 to 1000, tightly covering the original text.").append(nl)
+        sb.append("Skip text that is already Bengali. Return at most 22 items.").append(nl)
+        sb.append("Output only JSON: {\"items\":[{\"translated_text\":\"...\",\"box_2d\":[0,0,0,0]}]}").append(nl)
         if (known.isNotEmpty()) {
             sb.append("These texts are already translated separately, skip them:").append(nl)
             var count = 0
@@ -1063,7 +1109,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return ArrayList()
     }
 
-    // thinkingLevel কম রাখলে উত্তর অনেক দ্রুত আসে; কোনো মডেল না মানলে সেটিং ছাড়াই আবার চেষ্টা
     private fun callGemini(key: String, model: String, prompt: String, imageB64: String?, level: String): Pair<String?, Int> {
         val skip = synchronized(comboLock) { noThinking.contains(model) }
         if (skip) return rawCall(key, model, prompt, imageB64, null)
@@ -1098,7 +1143,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val contents = JSONArray()
             contents.put(content)
             val gen = JSONObject()
-            gen.put("maxOutputTokens", 8192)
+            gen.put("maxOutputTokens", 16384)
             gen.put("responseMimeType", "application/json")
             if (level != null) {
                 val tc = JSONObject()
@@ -1182,7 +1227,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 arr = JSONArray(txt)
             } else {
                 val o = JSONObject(txt)
-                arr = o.optJSONArray("translations")
+                arr = o.optJSONArray("t")
+                if (arr == null) arr = o.optJSONArray("translations")
                 if (arr == null) arr = o.optJSONArray("items")
                 if (arr == null) arr = o.optJSONArray("data")
             }
@@ -1196,10 +1242,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 var value = ""
                 var local = -1
                 if (e is JSONObject) {
-                    value = e.optString("translated_text", "")
+                    value = e.optString("b", "")
+                    if (value.isBlank()) value = e.optString("translated_text", "")
                     if (value.isBlank()) value = e.optString("text", "")
                     if (value.isBlank()) value = e.optString("bangla", "")
-                    local = e.optInt("id", -1)
+                    local = e.optInt("i", -1)
+                    if (local < 1) local = e.optInt("id", -1)
                 } else {
                     value = e.toString()
                 }
@@ -1221,10 +1269,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun regexRescue(body: String, chunk: List<Item>, out: MutableMap<Int, String>): Int {
         var added = 0
         try {
-            val rx = Regex("\"id\"\\s*:\\s*(\\d+)[\\s\\S]{0,60}?\"translated_text\"\\s*:\\s*\"([^\"]*)\"")
+            val q = Char(34).toString()
+            val bs = Char(92).toString()
+            val rx = Regex("\"(?:i|id)\"\\s*:\\s*(\\d+)\\s*,\\s*\"(?:b|translated_text)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
             for (m in rx.findAll(body)) {
                 val local = m.groupValues[1].toIntOrNull() ?: continue
-                val value = oneLine(m.groupValues[2])
+                var value = m.groupValues[2].replace(bs + q, q).replace(bs + "n", " ")
+                value = oneLine(value)
                 if (value.isBlank()) continue
                 if (local < 1 || local > chunk.size) continue
                 val gid = chunk[local - 1].id
@@ -1396,10 +1447,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         handler.removeCallbacksAndMessages(null)
         removeViews()
         unregister()
-        try {
-            pool?.shutdownNow()
-        } catch (e: Exception) { }
-        pool = null
         super.onDestroy()
     }
 
@@ -1410,7 +1457,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private val MULTI_SPACE_REGEX = Regex("\\s{2,}")
         private const val MAX_NODES = 400
         private const val MAX_ITEMS = 100
-        private const val CHUNK = 25
+        private const val CHUNK_MIN = 10
+        private const val CHUNK_MAX = 40
+        private const val RETRY_CHUNK = 12
         private const val BOX_MAX_LINES = 6
         private const val CACHE_MAX = 800
         private const val TEXT_THINKING = "minimal"
