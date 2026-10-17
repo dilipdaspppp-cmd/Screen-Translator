@@ -67,6 +67,22 @@
             android:layout_marginBottom="16dp" />
 
         <CheckBox
+            android:id="@+id/cbAuto"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/auto_model"
+            android:textStyle="bold"
+            android:checked="true"
+            android:layout_marginBottom="4dp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/auto_help"
+            android:textSize="13sp"
+            android:layout_marginBottom="16dp" />
+
+        <CheckBox
             android:id="@+id/cbModel1"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -88,6 +104,29 @@
             android:layout_height="wrap_content"
             android:text="@string/model_3"
             android:checked="true"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/cbModel4"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/model_4"
+            android:checked="false"
+            android:layout_marginBottom="8dp" />
+
+        <CheckBox
+            android:id="@+id/cbModel5"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/model_5"
+            android:checked="false"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:id="@+id/tvSpeed"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="14sp"
             android:layout_marginBottom="24dp" />
 
         <Button
