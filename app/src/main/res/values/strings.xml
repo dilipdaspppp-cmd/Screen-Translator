@@ -24,6 +24,14 @@
     <string name="model_1">gemini-3.5-flash-lite</string>
     <string name="model_2">gemini-3.1-flash-lite</string>
     <string name="model_3">gemini-3-flash-preview</string>
+    <string name="model_4">gemini-3.8-flash</string>
+    <string name="model_5">gemini-3.6-flash</string>
+    <string name="auto_model">স্বয়ংক্রিয়: সবচেয়ে দ্রুত মডেল অ্যাপ নিজেই বেছে নেবে</string>
+    <string name="auto_help">এটা চালু থাকলে নিচে টিক দেওয়ার দরকার নেই। অ্যাপ সব মডেলের গতি মেপে যেটা এই মুহূর্তে সবচেয়ে দ্রুত সেটা আগে ব্যবহার করবে, আর কোনো মডেল আটকে গেলে নিজেই পরেরটায় চলে যাবে। এটা বন্ধ করলে নিচে যেগুলোতে টিক দেবেন শুধু সেগুলোই ব্যবহার হবে।</string>
+    <string name="speed_title">মাপা গতি (প্রায় ১০টা লেখা অনুবাদ করতে কত সময় লাগে):</string>
+    <string name="speed_sec">সেকেন্ড</string>
+    <string name="speed_none">এখনো মাপা হয়নি</string>
+    <string name="speed_bad">এখন কাজ করছে না</string>
     <string name="msg_saved">সেভ হয়েছে</string>
     <string name="msg_exit">সার্ভিস বন্ধ করা হলো</string>
     <string name="msg_need_overlay">ওভারলে পারমিশন দরকার</string>
