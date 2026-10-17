@@ -154,7 +154,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private val comboLock = Any()
     private var comboBase = 0
     private val cooldown = HashMap<String, Long>()
-    private val noThinking = HashSet<String>()
+    private val levelFix = HashMap<String, String>()
+    @Volatile private var autoMode = false
+    private val speedLock = Any()
+    private val speedVal = HashMap<String, Double>()
+    private val speedAt = HashMap<String, Long>()
+    private val probeAt = HashMap<String, Long>()
     private val session = AtomicInteger(0)
     private val cache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean {
@@ -185,6 +190,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        loadSpeeds()
         if (uiReady) {
             refreshMetrics()
             syncUiState()
@@ -1179,6 +1185,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
             try {
                 exec.shutdown()
             } catch (e: Exception) { }
+            if (autoMode) {
+                try {
+                    probeModels(keys)
+                } catch (e: Exception) { }
+            }
         }
     }
 
@@ -1225,10 +1236,23 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun comboOrder(keys: List<String>, models: List<String>, offset: Int): List<Int> {
         val total = keys.size * models.size
         val now = System.currentTimeMillis()
-        val base = synchronized(comboLock) { ((comboBase % total) + total) % total }
-        val first = base + (offset % keys.size) * models.size
         val ready = ArrayList<Int>()
         val cooled = ArrayList<Int>()
+        if (autoMode) {
+            for (mi in models.indices) {
+                for (j in keys.indices) {
+                    val ki = (offset + j) % keys.size
+                    val idx = ki * models.size + mi
+                    val tag = keys[ki] + "|" + models[mi]
+                    val until = synchronized(comboLock) { cooldown[tag] ?: 0L }
+                    if (until > now) cooled.add(idx) else ready.add(idx)
+                }
+            }
+            ready.addAll(cooled)
+            return ready
+        }
+        val base = synchronized(comboLock) { ((comboBase % total) + total) % total }
+        val first = base + (offset % keys.size) * models.size
         for (i in 0 until total) {
             val idx = (first + i) % total
             val tag = keys[idx / models.size] + "|" + models[idx % models.size]
@@ -1262,16 +1286,32 @@ class TranslatorAccessibilityService : AccessibilityService() {
         var lastCode = 0
         var remaining: List<Item> = chunk
         var okCalls = 0
+        var cutSlow = autoMode
         for (idx in order) {
             val key = keys[idx / models.size]
             val model = models[idx % models.size]
             val deep = force || hasDeep(remaining)
             val prompt = buildPrompt(remaining, appPkg, force)
             val level = if (deep) HARD_THINKING else TEXT_THINKING
+            val units = 4 + remaining.size
+            var limit = 0L
+            if (cutSlow) {
+                val sp = speedOf(model)
+                if (sp != null) {
+                    val factor = if (deep) 3.5 else 2.5
+                    var t = (sp * units * factor).toLong() + 4000L
+                    if (t < 8000L) t = 8000L
+                    if (t > 30000L) t = 30000L
+                    limit = t
+                }
+            }
             saveCurrentCombo(key, model)
-            val res = callGemini(key, model, prompt, null, level)
+            val t0 = System.currentTimeMillis()
+            val res = callGemini(key, model, prompt, null, level, limit)
+            val took = System.currentTimeMillis() - t0
             val body = res.first
             if (body != null) {
+                recordSpeed(model, took, units)
                 val tmp: MutableMap<Int, String> = HashMap()
                 parseTranslations(body, remaining, tmp)
                 val still = ArrayList<Item>()
@@ -1290,6 +1330,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 remaining = still
                 if (okCalls >= 2) break
             } else {
+                if (res.second == -1 && limit > 0L && took >= limit - 1000L) {
+                    recordSpeed(model, took * 2, units)
+                    cutSlow = false
+                }
                 lastCode = res.second
                 markBad(idx, keys, models, res.second)
             }
@@ -1409,21 +1453,40 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return ArrayList()
     }
 
-    private fun callGemini(key: String, model: String, prompt: String, imageB64: String?, level: String): Pair<String?, Int> {
-        val skip = synchronized(comboLock) { noThinking.contains(model) }
-        if (skip) return rawCall(key, model, prompt, imageB64, null)
-        val first = rawCall(key, model, prompt, imageB64, level)
-        if (first.second == 400) {
-            val second = rawCall(key, model, prompt, imageB64, null)
-            if (second.second == 200 || second.second == 204) {
-                synchronized(comboLock) { noThinking.add(model) }
-            }
-            return second
-        }
-        return first
+    private fun okCode(c: Int): Boolean {
+        return c == 200 || c == 204
     }
 
-    private fun rawCall(key: String, model: String, prompt: String, imageB64: String?, level: String?): Pair<String?, Int> {
+    private fun callGemini(key: String, model: String, prompt: String, imageB64: String?,
+                           level: String, timeoutMs: Long = 0L): Pair<String?, Int> {
+        val tag = model + "|" + level
+        val known = synchronized(comboLock) { levelFix[tag] }
+        if (known != null) {
+            val use = if (known.isEmpty()) null else known
+            return rawCall(key, model, prompt, imageB64, use, timeoutMs)
+        }
+        val first = rawCall(key, model, prompt, imageB64, level, timeoutMs)
+        if (first.second != 400) {
+            if (okCode(first.second)) synchronized(comboLock) { levelFix[tag] = level }
+            return first
+        }
+        var i = THINK_LEVELS.indexOf(level) + 1
+        if (i < 1) i = THINK_LEVELS.size
+        while (i < THINK_LEVELS.size) {
+            val lv = THINK_LEVELS[i]
+            val r = rawCall(key, model, prompt, imageB64, lv, timeoutMs)
+            if (r.second != 400) {
+                if (okCode(r.second)) synchronized(comboLock) { levelFix[tag] = lv }
+                return r
+            }
+            i++
+        }
+        val last = rawCall(key, model, prompt, imageB64, null, timeoutMs)
+        if (okCode(last.second)) synchronized(comboLock) { levelFix[tag] = "" }
+        return last
+    }
+
+    private fun rawCall(key: String, model: String, prompt: String, imageB64: String?, level: String?, timeoutMs: Long): Pair<String?, Int> {
         try {
             val parts = JSONArray()
             if (imageB64 != null) {
@@ -1460,7 +1523,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 .header("x-goog-api-key", key)
                 .post(requestBody)
                 .build()
-            val c = if (imageB64 != null) imageClient else textClient
+            var c = if (imageB64 != null) imageClient else textClient
+            if (timeoutMs > 0L) {
+                c = c.newBuilder()
+                    .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                    .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                    .build()
+            }
             c.newCall(request).execute().use { response ->
                 val code = response.code
                 val body = response.body?.string()
@@ -1693,11 +1762,108 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private fun getModels(): List<String> {
         val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+        autoMode = prefs.getBoolean("autoModel", true)
+        if (autoMode) return rankModels(ALL_MODELS)
         val models = mutableListOf<String>()
-        if (prefs.getBoolean("model1", true)) models.add("gemini-3.5-flash-lite")
-        if (prefs.getBoolean("model2", true)) models.add("gemini-3.1-flash-lite")
-        if (prefs.getBoolean("model3", true)) models.add("gemini-3-flash-preview")
+        if (prefs.getBoolean("model1", true)) models.add(ALL_MODELS[0])
+        if (prefs.getBoolean("model2", true)) models.add(ALL_MODELS[1])
+        if (prefs.getBoolean("model3", true)) models.add(ALL_MODELS[2])
+        if (prefs.getBoolean("model4", false)) models.add(ALL_MODELS[3])
+        if (prefs.getBoolean("model5", false)) models.add(ALL_MODELS[4])
         return models
+    }
+
+    private fun loadSpeeds() {
+        try {
+            val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+            synchronized(speedLock) {
+                for (m in ALL_MODELS) {
+                    val v = prefs.getFloat("spd_" + m, -1f)
+                    if (v > 0f) {
+                        speedVal[m] = v.toDouble()
+                        speedAt[m] = prefs.getLong("spdt_" + m, 0L)
+                    }
+                }
+            }
+        } catch (e: Exception) { }
+    }
+
+    private fun recordSpeed(model: String, ms: Long, units: Int) {
+        if (ms <= 0L || units <= 0) return
+        val v = ms.toDouble() / units.toDouble()
+        val now = System.currentTimeMillis()
+        var nv = v
+        synchronized(speedLock) {
+            val old = speedVal[model]
+            if (old != null && old < v * 20.0) {
+                val age = now - (speedAt[model] ?: 0L)
+                nv = if (age > SPEED_STALE_MS) old * 0.3 + v * 0.7 else old * 0.6 + v * 0.4
+            }
+            speedVal[model] = nv
+            speedAt[model] = now
+        }
+        try {
+            getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+                .putFloat("spd_" + model, nv.toFloat())
+                .putLong("spdt_" + model, now)
+                .apply()
+        } catch (e: Exception) { }
+    }
+
+    private fun speedOf(model: String): Double? {
+        synchronized(speedLock) {
+            return speedVal[model]
+        }
+    }
+
+    private fun priorSpeed(model: String): Double {
+        return if (model.contains("lite")) 300.0 else 600.0
+    }
+
+    private fun rankModels(list: List<String>): List<String> {
+        val score = HashMap<String, Double>()
+        for (m in list) score[m] = speedOf(m) ?: priorSpeed(m)
+        val out = ArrayList<String>(list)
+        out.sortWith(Comparator { a, b -> java.lang.Double.compare(score[a] ?: 0.0, score[b] ?: 0.0) })
+        return out
+    }
+
+    private fun probePrompt(): String {
+        return "Translate the English word Hello into Bengali. Output only JSON: {" + qq("b") + ":" + qq("...") + "}"
+    }
+
+    private fun probeModels(keys: List<String>) {
+        if (keys.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val due = ArrayList<String>()
+        synchronized(speedLock) {
+            for (m in ALL_MODELS) {
+                val last = speedAt[m] ?: 0L
+                val tried = probeAt[m] ?: 0L
+                if (now - last > PROBE_EVERY_MS && now - tried > PROBE_EVERY_MS) {
+                    due.add(m)
+                    probeAt[m] = now
+                }
+            }
+        }
+        for (i in due.indices) {
+            val m = due[i]
+            val key = keys[(i + 1) % keys.size]
+            Thread {
+                try {
+                    val t0 = System.currentTimeMillis()
+                    val res = callGemini(key, m, probePrompt(), null, TEXT_THINKING, 20000L)
+                    val ms = System.currentTimeMillis() - t0
+                    if (res.first != null) {
+                        recordSpeed(m, ms, PROBE_UNITS)
+                    } else if (res.second == 400 || res.second == 403 || res.second == 404) {
+                        recordSpeed(m, 600000L, PROBE_UNITS)
+                    } else if (res.second == -1) {
+                        recordSpeed(m, 40000L, PROBE_UNITS)
+                    }
+                } catch (e: Exception) { }
+            }.start()
+        }
     }
 
     private fun saveCurrentCombo(key: String, model: String) {
@@ -1769,5 +1935,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val COLOR_IDLE = "#2196F3"
         private const val COLOR_BUSY = "#FF9800"
         private const val COLOR_DONE = "#4CAF50"
+        private const val PROBE_EVERY_MS = 600000L
+        private const val SPEED_STALE_MS = 1800000L
+        private const val PROBE_UNITS = 5
+        private val THINK_LEVELS = listOf("minimal", "low", "medium", "high")
+        private val ALL_MODELS = listOf(
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash"
+        )
     }
 }
