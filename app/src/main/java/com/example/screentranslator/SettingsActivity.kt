@@ -6,9 +6,19 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.TextView
 import android.widget.Toast
+import java.util.Locale
 
 class SettingsActivity : Activity() {
+    private val modelNames = listOf(
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-3.8-flash",
+        "gemini-3.6-flash"
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
@@ -19,10 +29,15 @@ class SettingsActivity : Activity() {
         val etKey4 = findViewById<EditText>(R.id.etKey4)
         val etKey5 = findViewById<EditText>(R.id.etKey5)
 
+        val cbAuto = findViewById<CheckBox>(R.id.cbAuto)
         val cbModel1 = findViewById<CheckBox>(R.id.cbModel1)
         val cbModel2 = findViewById<CheckBox>(R.id.cbModel2)
         val cbModel3 = findViewById<CheckBox>(R.id.cbModel3)
+        val cbModel4 = findViewById<CheckBox>(R.id.cbModel4)
+        val cbModel5 = findViewById<CheckBox>(R.id.cbModel5)
+        val boxes = listOf(cbModel1, cbModel2, cbModel3, cbModel4, cbModel5)
 
+        val tvSpeed = findViewById<TextView>(R.id.tvSpeed)
         val btnSave = findViewById<Button>(R.id.btnSave)
 
         val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
@@ -35,6 +50,14 @@ class SettingsActivity : Activity() {
         cbModel1.isChecked = prefs.getBoolean("model1", true)
         cbModel2.isChecked = prefs.getBoolean("model2", true)
         cbModel3.isChecked = prefs.getBoolean("model3", true)
+        cbModel4.isChecked = prefs.getBoolean("model4", false)
+        cbModel5.isChecked = prefs.getBoolean("model5", false)
+
+        cbAuto.isChecked = prefs.getBoolean("autoModel", true)
+        applyAuto(cbAuto.isChecked, boxes)
+        cbAuto.setOnCheckedChangeListener { _, checked -> applyAuto(checked, boxes) }
+
+        tvSpeed.text = speedText()
 
         btnSave.setOnClickListener {
             prefs.edit().apply {
@@ -44,14 +67,53 @@ class SettingsActivity : Activity() {
                 putString("key4", etKey4.text.toString().trim())
                 putString("key5", etKey5.text.toString().trim())
 
+                putBoolean("autoModel", cbAuto.isChecked)
                 putBoolean("model1", cbModel1.isChecked)
                 putBoolean("model2", cbModel2.isChecked)
                 putBoolean("model3", cbModel3.isChecked)
+                putBoolean("model4", cbModel4.isChecked)
+                putBoolean("model5", cbModel5.isChecked)
 
                 apply()
             }
             Toast.makeText(this, getString(R.string.msg_saved), Toast.LENGTH_SHORT).show()
             finish()
         }
+    }
+
+    private fun applyAuto(auto: Boolean, boxes: List<CheckBox>) {
+        for (b in boxes) {
+            b.isEnabled = !auto
+            b.alpha = if (auto) 0.4f else 1f
+        }
+    }
+
+    private fun speedText(): String {
+        val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+        val nl = Char(10).toString()
+        val known = ArrayList<Pair<String, Float>>()
+        val unknown = ArrayList<String>()
+        for (m in modelNames) {
+            val v = prefs.getFloat("spd_" + m, -1f)
+            if (v > 0f) known.add(Pair(m, v)) else unknown.add(m)
+        }
+        known.sortBy { it.second }
+        val sb = StringBuilder()
+        sb.append(getString(R.string.speed_title))
+        var rank = 1
+        for (p in known) {
+            val sec = p.second * 14f / 1000f
+            sb.append(nl).append(rank).append(". ").append(p.first).append(" — ")
+            if (sec > 60f) {
+                sb.append(getString(R.string.speed_bad))
+            } else {
+                sb.append(String.format(Locale.US, "%.1f", sec)).append(" ").append(getString(R.string.speed_sec))
+            }
+            rank++
+        }
+        for (m in unknown) {
+            sb.append(nl).append("• ").append(m).append(" — ").append(getString(R.string.speed_none))
+        }
+        return sb.toString()
     }
 }
