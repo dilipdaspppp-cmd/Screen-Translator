@@ -154,6 +154,28 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private val comboLock = Any()
     private var comboBase = 0
     private val cooldown = HashMap<String, Long>()
+    private class CallSlot {
+        @Volatile var call: okhttp3.Call? = null
+        @Volatile var cancelled = false
+        fun cancel() {
+            cancelled = true
+            try {
+                call?.cancel()
+            } catch (e: Exception) { }
+        }
+    }
+
+    private class Done(val idx: Int, val body: String?, val code: Int, val took: Long)
+
+    private class FastResult(val body: String?, val code: Int)
+
+    private class ShotBox {
+        @Volatile var done = false
+        @Volatile var data: String? = null
+    }
+
+    private val netPool: ExecutorService = Executors.newCachedThreadPool()
+    @Volatile private var cacheDirty = false
     private val levelFix = HashMap<String, String>()
     @Volatile private var autoMode = false
     private val speedLock = Any()
@@ -175,7 +197,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private val textClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(40, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
         .callTimeout(50, TimeUnit.SECONDS)
@@ -191,6 +213,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         loadSpeeds()
+        Thread { loadCache() }.start()
         if (uiReady) {
             refreshMetrics()
             syncUiState()
@@ -496,16 +519,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
         futures.addAll(submitChunks(exec, easy, size, keys, models, map, appPkg, 0, false))
         futures.addAll(submitChunks(exec, hardItems, HARD_CHUNK, keys, models, map, appPkg, futures.size, false))
 
+        val box = ShotBox()
+        Thread { runJob(mySession, exec, items, map, futures, box, keys, models, appPkg) }.start()
+
         handler.postDelayed({
             captureScreen { shot ->
-                if (items.isEmpty() && shot == null) {
-                    try { exec.shutdownNow() } catch (e: Exception) { }
-                    resetWork()
-                    toast(getString(R.string.msg_no_text))
-                } else {
+                box.data = shot
+                box.done = true
+                if (session.get() == mySession && isWorking) {
                     buttonView?.visibility = View.VISIBLE
                     setButtonColor(COLOR_BUSY)
-                    Thread { runJob(mySession, exec, items, map, futures, shot, keys, models, appPkg) }.start()
                 }
             }
         }, 200)
@@ -1017,7 +1040,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         var lastCode = 0
         for (f in futures) {
             val c = try {
-                f.get(100, TimeUnit.SECONDS)
+                f.get(70, TimeUnit.SECONDS)
             } catch (e: Exception) {
                 -1
             }
@@ -1071,40 +1094,67 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun runJob(mySession: Int, exec: ExecutorService, items: List<Item>,
-                       map: MutableMap<Int, String>, futures: List<Future<Int>>, shot: String?,
+                       map: MutableMap<Int, String>, futures: List<Future<Int>>, box: ShotBox,
                        keys: List<String>, models: List<String>, appPkg: String) {
         val textRef = java.util.concurrent.atomic.AtomicReference<List<Item>>(emptyList())
         val imageRef = java.util.concurrent.atomic.AtomicReference<List<Item>>(emptyList())
         val shownFlag = java.util.concurrent.atomic.AtomicBoolean(false)
         val drawLock = Any()
+        val jobStart = System.currentTimeMillis()
         var lastCode = 0
+        var shotTask: java.util.concurrent.FutureTask<Int>? = null
         try {
-            var shotFuture: Future<Int>? = null
-            if (shot != null) {
-                val so = futures.size
-                shotFuture = try {
-                    exec.submit(Callable<Int> {
-                        val res = translateShot(shot, items, keys, models, so)
-                        imageRef.set(res)
-                        if (res.isNotEmpty()) {
-                            if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
+            val left = ArrayList<Future<Int>>(futures)
+            var seen = -1
+            while (true) {
+                val now = System.currentTimeMillis()
+                if (shotTask == null && (box.done || now - jobStart > SHOT_WAIT_MS)) {
+                    val data = box.data
+                    val so = futures.size
+                    val task = java.util.concurrent.FutureTask<Int>(Callable<Int> {
+                        if (data != null) {
+                            val res = translateShot(data, items, keys, models, so)
+                            imageRef.set(res)
+                            if (res.isNotEmpty()) {
+                                if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
+                            }
                         }
                         200
                     })
-                } catch (e: Exception) {
-                    null
+                    Thread(task).start()
+                    shotTask = task
                 }
+                val iter = left.iterator()
+                while (iter.hasNext()) {
+                    val f = iter.next()
+                    if (f.isDone) {
+                        val c = try {
+                            f.get()
+                        } catch (e: Exception) {
+                            -1
+                        }
+                        if (c != 200) lastCode = c
+                        iter.remove()
+                    }
+                }
+                if (box.done || now - jobStart > DRAW_GATE_MS) {
+                    val sz = map.size
+                    if (sz != seen) {
+                        seen = sz
+                        val te = buildTextEntries(items, map)
+                        if (te.isNotEmpty()) {
+                            textRef.set(te)
+                            saveError("")
+                            if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
+                        }
+                    }
+                }
+                if (left.isEmpty() && shotTask != null && seen == map.size) break
+                if (System.currentTimeMillis() - jobStart > JOB_WAIT_MS) break
+                Thread.sleep(POLL_MS)
             }
 
-            lastCode = waitAll(futures)
-
-            var textEntries = buildTextEntries(items, map)
-            textRef.set(textEntries)
-            if (textEntries.isNotEmpty()) {
-                saveError("")
-                if (redrawNow(mySession, drawLock, textRef, imageRef)) shownFlag.set(true)
-            }
-
+            var textEntries = textRef.get()
             var round = 0
             while (round < 2) {
                 val redo = ArrayList<Item>()
@@ -1147,9 +1197,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 round++
             }
 
-            if (shotFuture != null) {
+            if (shotTask != null) {
                 try {
-                    shotFuture.get(100, TimeUnit.SECONDS)
+                    shotTask.get(60, TimeUnit.SECONDS)
                 } catch (e: Exception) { }
             }
 
@@ -1184,6 +1234,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
         } finally {
             try {
                 exec.shutdown()
+            } catch (e: Exception) { }
+            try {
+                saveCache()
             } catch (e: Exception) { }
             if (autoMode) {
                 try {
@@ -1229,8 +1282,47 @@ class TranslatorAccessibilityService : AccessibilityService() {
         if (squash(text) == squash(tr)) return
         if (!hasBengali(tr)) return
         synchronized(cache) {
-            cache[text] = tr
+            if (cache[text] != tr) {
+                cache[text] = tr
+                cacheDirty = true
+            }
         }
+    }
+
+    private fun loadCache() {
+        try {
+            val f = java.io.File(filesDir, CACHE_FILE)
+            if (!f.exists()) return
+            val o = JSONObject(f.readText())
+            val names = o.keys()
+            synchronized(cache) {
+                while (names.hasNext()) {
+                    val k = names.next()
+                    val v = o.optString(k, "")
+                    if (v.isNotBlank() && !cache.containsKey(k)) cache[k] = v
+                }
+            }
+        } catch (e: Exception) { }
+    }
+
+    private fun saveCache() {
+        if (!cacheDirty) return
+        cacheDirty = false
+        try {
+            val o = JSONObject()
+            synchronized(cache) {
+                for (e in cache.entries) {
+                    o.put(e.key, e.value)
+                }
+            }
+            val f = java.io.File(filesDir, CACHE_FILE)
+            val tmp = java.io.File(filesDir, CACHE_FILE + ".tmp")
+            tmp.writeText(o.toString())
+            if (!tmp.renameTo(f)) {
+                f.writeText(o.toString())
+                tmp.delete()
+            }
+        } catch (e: Exception) { }
     }
 
     private fun comboOrder(keys: List<String>, models: List<String>, offset: Int): List<Int> {
@@ -1267,6 +1359,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val total = keys.size * models.size
         val tag = keys[idx / models.size] + "|" + models[idx % models.size]
         val ms = when {
+            code == 4290 -> 3600000L
             code == 429 -> 60000L
             code == 401 || code == 403 || code == 404 -> 600000L
             code >= 500 -> 15000L
@@ -1282,64 +1375,204 @@ class TranslatorAccessibilityService : AccessibilityService() {
                                out: MutableMap<Int, String>, appPkg: String, offset: Int,
                                force: Boolean): Int {
         if (chunk.isEmpty()) return 200
-        val order = comboOrder(keys, models, offset)
         var lastCode = 0
         var remaining: List<Item> = chunk
-        var okCalls = 0
-        var cutSlow = autoMode
-        for (idx in order) {
-            val key = keys[idx / models.size]
-            val model = models[idx % models.size]
+        var pass = 0
+        while (pass < CHUNK_PASSES && remaining.isNotEmpty()) {
             val deep = force || hasDeep(remaining)
             val prompt = buildPrompt(remaining, appPkg, force)
             val level = if (deep) HARD_THINKING else TEXT_THINKING
-            val units = 4 + remaining.size
-            var limit = 0L
-            if (cutSlow) {
-                val sp = speedOf(model)
-                if (sp != null) {
-                    val factor = if (deep) 3.5 else 2.5
-                    var t = (sp * units * factor).toLong() + 4000L
-                    if (t < 8000L) t = 8000L
-                    if (t > 30000L) t = 30000L
-                    limit = t
+            val order = comboOrder(keys, models, offset + pass)
+            val res = fastCall(keys, models, order, prompt, null, level, 4 + remaining.size)
+            val body = res.body
+            if (body == null) {
+                lastCode = res.code
+                break
+            }
+            val tmp: MutableMap<Int, String> = HashMap()
+            parseTranslations(body, remaining, tmp)
+            val still = ArrayList<Item>()
+            for (it0 in remaining) {
+                val v = tmp[it0.id]
+                if (v != null && goodTr(it0.text, v)) {
+                    out[it0.id] = v
+                } else {
+                    if (v != null && softOk(it0.text, v)) out[-it0.id] = v
+                    still.add(it0)
                 }
             }
-            saveCurrentCombo(key, model)
-            val t0 = System.currentTimeMillis()
-            val res = callGemini(key, model, prompt, null, level, limit)
-            val took = System.currentTimeMillis() - t0
-            val body = res.first
-            if (body != null) {
-                recordSpeed(model, took, units)
-                val tmp: MutableMap<Int, String> = HashMap()
-                parseTranslations(body, remaining, tmp)
-                val still = ArrayList<Item>()
-                for (it0 in remaining) {
-                    val v = tmp[it0.id]
-                    if (v != null && goodTr(it0.text, v)) {
-                        out[it0.id] = v
-                    } else {
-                        if (v != null && softOk(it0.text, v)) out[-it0.id] = v
-                        still.add(it0)
-                    }
-                }
-                okCalls++
-                lastCode = 204
-                if (still.isEmpty()) return 200
-                remaining = still
-                if (okCalls >= 2) break
-            } else {
-                if (res.second == -1 && limit > 0L && took >= limit - 1000L) {
-                    recordSpeed(model, took * 2, units)
-                    cutSlow = false
-                }
-                lastCode = res.second
-                markBad(idx, keys, models, res.second)
-            }
+            lastCode = 204
+            if (still.isEmpty()) return 200
+            remaining = still
+            pass++
         }
         if (remaining.size < chunk.size) return 200
         return lastCode
+    }
+
+    private fun hedgeDelay(model: String, units: Int, isImage: Boolean): Long {
+        if (isImage) return IMAGE_SWITCH_MS
+        val sp = speedOf(model) ?: return TEXT_SWITCH_MS
+        var t = (sp * units * 2.0).toLong() + 2500L
+        if (t < SWITCH_MIN_MS) t = SWITCH_MIN_MS
+        if (t > SWITCH_MAX_MS) t = SWITCH_MAX_MS
+        return t
+    }
+
+    private fun markSlow(idx: Int, keys: List<String>, models: List<String>) {
+        val tag = keys[idx / models.size] + "|" + models[idx % models.size]
+        synchronized(comboLock) {
+            val until = System.currentTimeMillis() + 15000L
+            val old = cooldown[tag] ?: 0L
+            if (until > old) cooldown[tag] = until
+        }
+    }
+
+    private fun pickNext(keys: List<String>, models: List<String>, order: List<Int>,
+                         tried: Set<Int>, live: Set<Int>): Int {
+        val liveKeys = HashSet<Int>()
+        val liveModels = HashSet<Int>()
+        for (i in live) {
+            liveKeys.add(i / models.size)
+            liveModels.add(i % models.size)
+        }
+        val now = System.currentTimeMillis()
+        var best = -1
+        var bestScore = Int.MIN_VALUE
+        for (idx in order) {
+            if (tried.contains(idx)) continue
+            val ki = idx / models.size
+            val mi = idx % models.size
+            var s = 0
+            if (!liveModels.contains(mi)) s += 2
+            if (!liveKeys.contains(ki)) s += 1
+            val tag = keys[ki] + "|" + models[mi]
+            val until = synchronized(comboLock) { cooldown[tag] ?: 0L }
+            if (until - now > LONG_BLOCK_MS) continue
+            if (until > now) s -= 10
+            val sp = speedOf(models[mi])
+            if (sp != null && sp > DEAD_SPEED) s -= 5
+            if (s > bestScore) {
+                best = idx
+                bestScore = s
+            }
+        }
+        return best
+    }
+
+    private fun fastCall(keys: List<String>, models: List<String>, order: List<Int>, prompt: String,
+                         imageB64: String?, level: String, units: Int): FastResult {
+        if (order.isEmpty()) return FastResult(null, 0)
+        val isImage = imageB64 != null
+        val maxLive = if (isImage) IMAGE_MAX_LIVE else TEXT_MAX_LIVE
+        val budget = if (isImage) IMAGE_TOTAL_MS else TEXT_TOTAL_MS
+        val callMs = if (isImage) IMAGE_CALL_MS else TEXT_CALL_MS
+        val queue = java.util.concurrent.LinkedBlockingQueue<Done>()
+        val live = HashMap<Int, CallSlot>()
+        val startAt = HashMap<Int, Long>()
+        val tried = HashSet<Int>()
+        val begin = System.currentTimeMillis()
+        var lastCode = 0
+        var nextHedge = Long.MAX_VALUE
+
+        fun launch(idx: Int) {
+            val key = keys[idx / models.size]
+            val model = models[idx % models.size]
+            val slot = CallSlot()
+            val t0 = System.currentTimeMillis()
+            tried.add(idx)
+            live[idx] = slot
+            startAt[idx] = t0
+            saveCurrentCombo(key, model)
+            nextHedge = t0 + hedgeDelay(model, units, isImage)
+            try {
+                netPool.execute {
+                    var body: String? = null
+                    var code = -1
+                    try {
+                        val r = callGemini(key, model, prompt, imageB64, level, callMs, slot)
+                        body = r.first
+                        code = r.second
+                    } catch (e: Exception) { }
+                    if (slot.cancelled) code = -2
+                    queue.offer(Done(idx, body, code, System.currentTimeMillis() - t0))
+                }
+            } catch (e: Exception) {
+                queue.offer(Done(idx, null, -1, 0L))
+            }
+        }
+
+        val first = pickNext(keys, models, order, tried, live.keys)
+        if (first < 0) return FastResult(null, 0)
+        launch(first)
+        while (true) {
+            val now = System.currentTimeMillis()
+            val left = begin + budget - now
+            if (left <= 0L) break
+            if (live.isEmpty()) {
+                val n = pickNext(keys, models, order, tried, live.keys)
+                if (n < 0) break
+                launch(n)
+                continue
+            }
+            var wait = nextHedge - now
+            if (wait > left) wait = left
+            if (wait < 1L) wait = 1L
+            val d = try {
+                queue.poll(wait, TimeUnit.MILLISECONDS)
+            } catch (e: Exception) {
+                null
+            }
+            if (d == null) {
+                if (System.currentTimeMillis() >= nextHedge) {
+                    val n = pickNext(keys, models, order, tried, live.keys)
+                    if (n >= 0) {
+                        if (live.size >= maxLive) {
+                            val end = System.currentTimeMillis()
+                            for (li in live.keys) {
+                                val el = end - (startAt[li] ?: end)
+                                if (!isImage) recordSpeed(models[li % models.size], el * 2L, units)
+                                markSlow(li, keys, models)
+                            }
+                            for (sl in live.values) sl.cancel()
+                            live.clear()
+                        }
+                        launch(n)
+                    } else {
+                        nextHedge = System.currentTimeMillis() + 1000L
+                    }
+                }
+                continue
+            }
+            if (live.remove(d.idx) == null) continue
+            val model = models[d.idx % models.size]
+            val body = d.body
+            if (body != null) {
+                if (!isImage) {
+                    recordSpeed(model, d.took, units)
+                    val end = System.currentTimeMillis()
+                    for (li in live.keys) {
+                        val el = end - (startAt[li] ?: end)
+                        if (el > d.took) recordSpeed(models[li % models.size], (el * 3L) / 2L, units)
+                    }
+                }
+                for (s in live.values) s.cancel()
+                live.clear()
+                return FastResult(body, 200)
+            }
+            if (d.code != -2) {
+                lastCode = d.code
+                markBad(d.idx, keys, models, d.code)
+            }
+            if (live.size < maxLive) {
+                val n = pickNext(keys, models, order, tried, live.keys)
+                if (n >= 0) launch(n)
+            }
+        }
+        for (sl in live.values) sl.cancel()
+        live.clear()
+        if (lastCode == 4290) lastCode = 429
+        return FastResult(null, if (lastCode == 0) -1 else lastCode)
     }
 
     private fun qq(s: String): String {
@@ -1441,52 +1674,74 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val full = known.size < 4
         val prompt = buildShotPrompt(known, full)
         val order = comboOrder(keys, models, offset)
-        for (idx in order) {
-            val key = keys[idx / models.size]
-            val model = models[idx % models.size]
-            saveCurrentCombo(key, model)
-            val res = callGemini(key, model, prompt, b64, SHOT_THINKING)
-            val body = res.first
-            if (body != null) return parseShot(body)
-            markBad(idx, keys, models, res.second)
-        }
-        return ArrayList()
+        val res = fastCall(keys, models, order, prompt, b64, SHOT_THINKING, 0)
+        val body = res.body ?: return ArrayList()
+        return parseShot(body)
     }
 
     private fun okCode(c: Int): Boolean {
         return c == 200 || c == 204
     }
 
+    private fun rememberLevel(tag: String, lv: String) {
+        val old = synchronized(comboLock) {
+            val o = levelFix[tag]
+            levelFix[tag] = lv
+            o
+        }
+        if (old != lv) {
+            try {
+                getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+                    .putString("lvl_" + tag, lv).apply()
+            } catch (e: Exception) { }
+        }
+    }
+
+    private fun forgetLevel(tag: String) {
+        synchronized(comboLock) { levelFix.remove(tag) }
+        try {
+            getSharedPreferences("AppPrefs", Context.MODE_PRIVATE).edit()
+                .remove("lvl_" + tag).apply()
+        } catch (e: Exception) { }
+    }
+
     private fun callGemini(key: String, model: String, prompt: String, imageB64: String?,
-                           level: String, timeoutMs: Long = 0L): Pair<String?, Int> {
+                           level: String, timeoutMs: Long = 0L, slot: CallSlot? = null): Pair<String?, Int> {
         val tag = model + "|" + level
         val known = synchronized(comboLock) { levelFix[tag] }
+        var skipLevel: String? = null
+        var skipUsed = false
         if (known != null) {
             val use = if (known.isEmpty()) null else known
-            return rawCall(key, model, prompt, imageB64, use, timeoutMs)
+            val r = rawCall(key, model, prompt, imageB64, use, timeoutMs, slot)
+            if (r.second != 400) return r
+            forgetLevel(tag)
+            skipLevel = use
+            skipUsed = true
         }
-        val first = rawCall(key, model, prompt, imageB64, level, timeoutMs)
-        if (first.second != 400) {
-            if (okCode(first.second)) synchronized(comboLock) { levelFix[tag] = level }
-            return first
-        }
-        var i = THINK_LEVELS.indexOf(level) + 1
-        if (i < 1) i = THINK_LEVELS.size
+        val tries = ArrayList<String?>()
+        var i = THINK_LEVELS.indexOf(level)
+        if (i < 0) i = THINK_LEVELS.size
         while (i < THINK_LEVELS.size) {
-            val lv = THINK_LEVELS[i]
-            val r = rawCall(key, model, prompt, imageB64, lv, timeoutMs)
-            if (r.second != 400) {
-                if (okCode(r.second)) synchronized(comboLock) { levelFix[tag] = lv }
-                return r
-            }
+            tries.add(THINK_LEVELS[i])
             i++
         }
-        val last = rawCall(key, model, prompt, imageB64, null, timeoutMs)
-        if (okCode(last.second)) synchronized(comboLock) { levelFix[tag] = "" }
+        tries.add(null)
+        var last: Pair<String?, Int> = Pair(null, 400)
+        for (lv in tries) {
+            if (slot != null && slot.cancelled) return Pair(null, -2)
+            if (skipUsed && lv == skipLevel) continue
+            val r = rawCall(key, model, prompt, imageB64, lv, timeoutMs, slot)
+            if (r.second != 400) {
+                if (okCode(r.second)) rememberLevel(tag, lv ?: "")
+                return r
+            }
+            last = r
+        }
         return last
     }
 
-    private fun rawCall(key: String, model: String, prompt: String, imageB64: String?, level: String?, timeoutMs: Long): Pair<String?, Int> {
+    private fun rawCall(key: String, model: String, prompt: String, imageB64: String?, level: String?, timeoutMs: Long, slot: CallSlot?): Pair<String?, Int> {
         try {
             val parts = JSONArray()
             if (imageB64 != null) {
@@ -1530,7 +1785,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
                     .build()
             }
-            c.newCall(request).execute().use { response ->
+            if (slot != null && slot.cancelled) return Pair(null, -2)
+            val call = c.newCall(request)
+            slot?.call = call
+            if (slot != null && slot.cancelled) call.cancel()
+            call.execute().use { response ->
                 val code = response.code
                 val body = response.body?.string()
                 if (code == 200 && body != null) {
@@ -1553,6 +1812,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
                         }
                     }
                     return Pair(null, 204)
+                }
+                if (code == 429 && body != null && body.contains("PerDay")) {
+                    return Pair(null, 4290)
+                }
+                if (code == 400 && body != null && (body.contains("API key") || body.contains("API_KEY"))) {
+                    return Pair(null, 401)
                 }
                 return Pair(null, code)
             }
@@ -1776,6 +2041,15 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun loadSpeeds() {
         try {
             val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+            synchronized(comboLock) {
+                for (m in ALL_MODELS) {
+                    for (lv in THINK_LEVELS) {
+                        val tag = m + "|" + lv
+                        val v = prefs.getString("lvl_" + tag, null)
+                        if (v != null) levelFix[tag] = v
+                    }
+                }
+            }
             synchronized(speedLock) {
                 for (m in ALL_MODELS) {
                     val v = prefs.getFloat("spd_" + m, -1f)
@@ -1843,6 +2117,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 if (now - last > PROBE_EVERY_MS && now - tried > PROBE_EVERY_MS) {
                     due.add(m)
                     probeAt[m] = now
+                    break
                 }
             }
         }
@@ -1922,22 +2197,40 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private val CHAR_CR = Char(13)
         private const val MAX_NODES = 500
         private const val MAX_ITEMS = 200
-        private const val CHUNK_MIN = 8
+        private const val CHUNK_MIN = 10
         private const val CHUNK_MAX = 30
         private const val HARD_CHUNK = 12
-        private const val RETRY_CHUNK = 8
-        private const val RETRY_CHUNK_2 = 4
+        private const val RETRY_CHUNK = 12
+        private const val RETRY_CHUNK_2 = 6
+        private const val CHUNK_PASSES = 1
         private const val BOX_MAX_LINES = 6
-        private const val CACHE_MAX = 800
+        private const val CACHE_MAX = 1500
         private const val TEXT_THINKING = "minimal"
         private const val HARD_THINKING = "low"
         private const val SHOT_THINKING = "low"
         private const val COLOR_IDLE = "#2196F3"
         private const val COLOR_BUSY = "#FF9800"
         private const val COLOR_DONE = "#4CAF50"
-        private const val PROBE_EVERY_MS = 600000L
+        private const val PROBE_EVERY_MS = 3600000L
         private const val SPEED_STALE_MS = 1800000L
         private const val PROBE_UNITS = 5
+        private const val TEXT_MAX_LIVE = 1
+        private const val IMAGE_MAX_LIVE = 1
+        private const val TEXT_TOTAL_MS = 30000L
+        private const val IMAGE_TOTAL_MS = 50000L
+        private const val TEXT_CALL_MS = 25000L
+        private const val IMAGE_CALL_MS = 45000L
+        private const val TEXT_SWITCH_MS = 8000L
+        private const val IMAGE_SWITCH_MS = 18000L
+        private const val SWITCH_MIN_MS = 5000L
+        private const val SWITCH_MAX_MS = 12000L
+        private const val LONG_BLOCK_MS = 300000L
+        private const val DEAD_SPEED = 20000.0
+        private const val DRAW_GATE_MS = 1500L
+        private const val SHOT_WAIT_MS = 6500L
+        private const val JOB_WAIT_MS = 75000L
+        private const val POLL_MS = 100L
+        private const val CACHE_FILE = "tr_cache.json"
         private val THINK_LEVELS = listOf("minimal", "low", "medium", "high")
         private val ALL_MODELS = listOf(
             "gemini-3.5-flash-lite",
