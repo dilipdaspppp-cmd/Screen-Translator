@@ -12,7 +12,7 @@
     <string name="button_label">অ</string>
     <string name="label_key">Key: None</string>
     <string name="label_model">Model: None</string>
-    <string name="help_text">নিয়ম: প্রথমে সেটিংসে গিয়ে Gemini API key বসান, এরপর অনুবাদ চালু করুন চাপ দিয়ে Accessibility সেটিংস থেকে Screen Translator চালু করুন। নতুন APK বসানোর পর সার্ভিসটি একবার বন্ধ করে আবার চালু করবেন, না হলে ছবির ভেতরের লেখা অনুবাদ হবে না। এরপর যে কোনো অ্যাপে গিয়ে নীল ভাসমান বাটনে চাপ দিলে পুরো স্ক্রিন বাংলায় অনুবাদ হয়ে দেখাবে। আবার চাপ দিলে অনুবাদ সরে যাবে। বাটন অনেকক্ষণ কমলা হয়ে থাকলে আবার চাপ দিলে অনুবাদ বাতিল হয়ে যাবে। বাটনটি চেপে ধরে রাখলে বাটন লুকিয়ে যাবে, আর টেনে যে কোনো জায়গায় সরানো যাবে।</string>
+    <string name="help_text">নিয়ম: প্রথমে সেটিংসে গিয়ে Gemini API key বসান, এরপর অনুবাদ চালু করুন চাপ দিয়ে Accessibility সেটিংস থেকে Screen Translator চালু করুন। নতুন APK বসানোর পর সার্ভিসটি একবার বন্ধ করে আবার চালু করবেন, না হলে ছবির ভেতরের লেখা অনুবাদ হবে না। এরপর যে কোনো অ্যাপে গিয়ে নীল ভাসমান বাটনে চাপ দিলে পুরো স্ক্রিন বাংলায় অনুবাদ হয়ে দেখাবে। আবার চাপ দিলে অনুবাদ সরে যাবে। বাটন অনেকক্ষণ কমলা হয়ে থাকলে আবার চাপ দিলে অনুবাদ বাতিল হয়ে যাবে। বাটনটি চেপে ধরে রাখলে বাটন লুকিয়ে যাবে, আর টেনে যে কোনো জায়গায় সরানো যাবে। কোন key বা মডেল কখন বদলেছে, তা সেটিংসের নিচে ইতিহাসে দেখা যাবে।</string>
     <string name="api_keys_title">API Keys (পাঁচটি পর্যন্ত)</string>
     <string name="models_title">Models (যেগুলো ব্যবহার হবে)</string>
     <string name="save_text">সেভ করুন</string>
@@ -48,4 +48,10 @@
     <string name="msg_cancelled">অনুবাদ বাতিল করা হলো</string>
     <string name="msg_quota">এখন সব API key-এর লিমিট শেষ, একটু পরে আবার চেষ্টা করুন</string>
     <string name="err_net">নেটওয়ার্ক সমস্যা — ইন্টারনেট সংযোগ দেখুন</string>
+    <string name="history_title">Key আর মডেল বদলের ইতিহাস</string>
+    <string name="history_now">এখন চলছে:</string>
+    <string name="history_now_none">এখনো কোনো অনুবাদ হয়নি</string>
+    <string name="history_empty">এখনো কোনো ইতিহাস নেই</string>
+    <string name="clear_history">সব ইতিহাস মুছুন</string>
+    <string name="msg_history_cleared">ইতিহাস মুছে ফেলা হলো</string>
 </resources>
