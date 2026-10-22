@@ -3,6 +3,8 @@ package com.example.screentranslator
 import android.app.Activity
 import android.content.Context
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -18,6 +20,19 @@ class SettingsActivity : Activity() {
         "gemini-3.8-flash",
         "gemini-3.6-flash"
     )
+
+    private var tvSpeed: TextView? = null
+    private var tvNow: TextView? = null
+    private var tvHistory: TextView? = null
+    private var lastLog: String? = null
+
+    private val pollHandler = Handler(Looper.getMainLooper())
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            refreshLive()
+            pollHandler.postDelayed(this, 2000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,8 +52,11 @@ class SettingsActivity : Activity() {
         val cbModel5 = findViewById<CheckBox>(R.id.cbModel5)
         val boxes = listOf(cbModel1, cbModel2, cbModel3, cbModel4, cbModel5)
 
-        val tvSpeed = findViewById<TextView>(R.id.tvSpeed)
+        tvSpeed = findViewById(R.id.tvSpeed)
+        tvNow = findViewById(R.id.tvNow)
+        tvHistory = findViewById(R.id.tvHistory)
         val btnSave = findViewById<Button>(R.id.btnSave)
+        val btnClear = findViewById<Button>(R.id.btnClearHistory)
 
         val prefs = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
         etKey1.setText(prefs.getString("key1", ""))
@@ -57,7 +75,14 @@ class SettingsActivity : Activity() {
         applyAuto(cbAuto.isChecked, boxes)
         cbAuto.setOnCheckedChangeListener { _, checked -> applyAuto(checked, boxes) }
 
-        tvSpeed.text = speedText()
+        refreshLive()
+
+        btnClear.setOnClickListener {
+            prefs.edit().remove("switchLog").apply()
+            lastLog = null
+            refreshLive()
+            Toast.makeText(this, getString(R.string.msg_history_cleared), Toast.LENGTH_SHORT).show()
+        }
 
         btnSave.setOnClickListener {
             prefs.edit().apply {
@@ -78,6 +103,34 @@ class SettingsActivity : Activity() {
             }
             Toast.makeText(this, getString(R.string.msg_saved), Toast.LENGTH_SHORT).show()
             finish()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        pollHandler.removeCallbacks(pollRunnable)
+        pollHandler.post(pollRunnable)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        pollHandler.removeCallbacks(pollRunnable)
+    }
+
+    private fun refreshLive() {
+        val p = getSharedPreferences("AppPrefs", Context.MODE_PRIVATE)
+        tvSpeed?.text = speedText()
+        val key = p.getString("currentKey", "") ?: ""
+        val model = p.getString("currentModel", "") ?: ""
+        if (key.isBlank() || key == "None" || model.isBlank()) {
+            tvNow?.text = getString(R.string.history_now_none)
+        } else {
+            tvNow?.text = getString(R.string.history_now) + " " + key + " · " + model
+        }
+        val log = p.getString("switchLog", "") ?: ""
+        if (log != lastLog) {
+            lastLog = log
+            tvHistory?.text = if (log.isBlank()) getString(R.string.history_empty) else log
         }
     }
 
