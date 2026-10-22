@@ -35,6 +35,12 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.TextView
 import android.widget.Toast
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import okhttp3.Call
 import okhttp3.ConnectionPool
 import okhttp3.MediaType.Companion.toMediaType
@@ -45,7 +51,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Collections
+import java.util.Date
+import java.util.IdentityHashMap
+import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
@@ -190,10 +202,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private class ScreenRead(val found: List<Found>, val appPkg: String, val ownApp: Boolean, val media: Boolean)
 
-    private class Item(val text: String, val rect: Rect, size: Float, val node: AccessibilityNodeInfo?) {
+    private class Item(val text: String, r: Rect, size: Float, val node: AccessibilityNodeInfo?, val fromOcr: Boolean) {
+        @Volatile var rect: Rect = r
         @Volatile var srcSize = size
         @Volatile var dead = false
     }
+
+    private class OcrBox(val text: String, val rect: Rect, val size: Float)
 
     private class ImgEntry(val text: String, val rect: Rect, val srcSize: Float)
 
@@ -221,9 +236,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
         @Volatile var code = 0
         @Volatile var body: String? = null
         @Volatile var recorded = false
+        @Volatile var retryMs = -1L
+        @Volatile var flagged = false
     }
 
-    private class GroupResult(val lines: Int, val completed: Boolean)
+    private class GroupResult(val lines: Int, val completed: Boolean, val noMore: Boolean)
 
     private class WalkCtx(val out: ArrayList<Found>, val screen: Rect, val covers: List<Rect>,
                           val full: Boolean, val screenArea: Long, val screenH: Int) {
@@ -232,17 +249,22 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private class Job(val startAt: Long, val deadline: Long, val keys: List<String>,
-                      val models: List<String>, val auto: Boolean, val turn: Int) {
+                      val keyNames: Map<String, String>, val models: List<String>, val auto: Boolean) {
         val cancelled = AtomicBoolean(false)
         val finished = AtomicBoolean(false)
         val slots: MutableList<CallSlot> = Collections.synchronizedList(ArrayList<CallSlot>())
         val good = ConcurrentHashMap<String, String>()
         val soft = ConcurrentHashMap<String, String>()
+        val limits = ConcurrentHashMap<String, Int>()
         val images: MutableList<ImgEntry> = Collections.synchronizedList(ArrayList<ImgEntry>())
         val badCombos: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        val fixTried: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
         val lines = AtomicInteger(0)
+        val attempts = AtomicInteger(0)
+        val coolTries = AtomicInteger(0)
+        val shotLatch = CountDownLatch(1)
+        val itemsLock = Any()
         @Volatile var items: List<Item> = emptyList()
-        @Volatile var limits: Map<String, Int> = emptyMap()
         @Volatile var itemsReady = false
         @Volatile var appPkg = ""
         @Volatile var drawGate = false
@@ -250,6 +272,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
         @Volatile var saw429 = false
         @Volatile var endReason = 0
         @Volatile var eventSeen = false
+        @Volatile var media = false
+        @Volatile var hasArabic = false
 
         fun alive(): Boolean {
             return !cancelled.get() && !finished.get() && SystemClock.uptimeMillis() < deadline
@@ -289,6 +313,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private val speedVal = HashMap<String, Double>()
     private val speedAt = HashMap<String, Long>()
     private val firstLat = HashMap<String, Double>()
+    private val model429 = HashMap<String, HashMap<String, Long>>()
+    private val logLock = Any()
+    private val ocrLock = Any()
+    private var recognizer: TextRecognizer? = null
+    @Volatile private var ocrBroken = false
     @Volatile private var lastComboSaved = ""
     @Volatile private var cacheDirty = false
     private val cache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
@@ -339,6 +368,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         if (job == null) state = ST_IDLE
         loadSpeeds()
         runBg { loadCache() }
+        runBg { prewarmOcr() }
         if (uiReady) {
             refreshMetrics()
             syncUiState()
@@ -612,8 +642,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun startJob() {
         if (!uiReady) return
         refreshMetrics()
-        val keys = getKeys()
-        val auto = prefs().getBoolean("autoModel", true)
+        val p = prefs()
+        val keyNames = LinkedHashMap<String, String>()
+        for (i in 1..5) {
+            val k = (p.getString("key" + i, "") ?: "").trim()
+            if (k.isNotBlank() && !keyNames.containsKey(k)) keyNames[k] = "Key " + i
+        }
+        val keys = ArrayList<String>(keyNames.keys)
+        val auto = p.getBoolean("autoModel", true)
         val models = getModels(auto)
         if (keys.isEmpty() || models.isEmpty()) {
             saveError(getString(R.string.msg_no_key))
@@ -621,13 +657,20 @@ class TranslatorAccessibilityService : AccessibilityService() {
             return
         }
         val now = SystemClock.uptimeMillis()
-        val j = Job(now, now + JOB_DEADLINE_MS, keys, models, auto, keyTurn.getAndIncrement())
+        val j = Job(now, now + JOB_DEADLINE_MS, keys, keyNames, models, auto)
         job = j
         state = ST_BUSY
         clearOverlay()
         setButtonColor(COLOR_BUSY)
         handler.postDelayed({ watchdog(j) }, JOB_DEADLINE_MS + WATCHDOG_EXTRA_MS)
         if (System.currentTimeMillis() - lastNetAt > WARM_AFTER_MS) runBg { warmConnection() }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            captureForJob(j)
+            handler.postDelayed({ openGate(j) }, DRAW_GATE_MS)
+        } else {
+            j.shotLatch.countDown()
+            openGate(j)
+        }
         val ok = runBg {
             try {
                 runJob(j)
@@ -636,7 +679,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         if (!ok) finishJob(j)
     }
-
     private fun watchdog(j: Job) {
         if (j.finished.get()) return
         cancelSlots(j)
@@ -654,74 +696,50 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun runJob(j: Job) {
-        val read = readScreen(true)
-        if (!j.alive()) return
-        if (read == null) {
-            j.endReason = END_NO_SCREEN
-            return
+        val read = try {
+            readScreen(true)
+        } catch (t: Throwable) {
+            null
         }
-        if (read.ownApp) {
+        if (read != null && read.ownApp) {
             j.endReason = END_OWN_APP
+            j.itemsReady = true
             return
         }
-        j.appPkg = read.appPkg
-        val items = buildItems(read.found)
+        val items = if (read != null) buildItems(read.found) else ArrayList()
         val uniq = LinkedHashSet<String>()
-        val limits = HashMap<String, Int>()
         for (it0 in items) {
             uniq.add(it0.text)
             val lim = limitOf(it0)
-            val old = limits[it0.text]
-            if (old == null || lim < old) limits[it0.text] = lim
+            val old = j.limits[it0.text]
+            if (old == null || lim < old) j.limits[it0.text] = lim
         }
         for (t in uniq) {
             val c = cacheGet(t)
             if (c != null) j.good[t] = c
         }
-        j.limits = limits
+        j.appPkg = read?.appPkg ?: ""
+        j.media = read?.media ?: false
+        j.hasArabic = anyArabicScript(ArrayList(uniq))
         j.items = items
         j.itemsReady = true
-        val needShot = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (items.size < 4 || read.media)
-        val imageLatch = CountDownLatch(if (needShot) 1 else 0)
-        if (needShot) {
-            handler.post { captureForJob(j, imageLatch) }
-            handler.postDelayed({ openGate(j) }, DRAW_GATE_MS)
-        } else {
-            handler.post { openGate(j) }
-        }
         if (j.eventSeen) handler.post { scheduleVerify() }
-        if (items.isEmpty() && !needShot) {
-            j.endReason = END_NO_TEXT
-            return
+        if (items.isNotEmpty()) {
+            requestDraw()
+            runBg { refineSizes(j) }
         }
-        runBg { refineSizes(j) }
         val pending = ArrayList<String>()
         for (t in uniq) {
             if (!j.good.containsKey(t)) pending.add(t)
         }
-        if (pending.isNotEmpty()) {
-            val normal = ArrayList<String>()
-            val hard = ArrayList<String>()
-            for (t in pending) {
-                if (isHardText(t)) hard.add(t) else normal.add(t)
-            }
-            val parts = ArrayList<List<String>>()
-            val strongFlags = ArrayList<Boolean>()
-            for (p in splitParts(normal, PART_ITEMS, PART_CHARS, MAX_PARTS)) {
-                parts.add(p)
-                strongFlags.add(false)
-            }
-            for (p in splitParts(hard, HARD_PART_ITEMS, HARD_PART_CHARS, 2)) {
-                parts.add(p)
-                strongFlags.add(true)
-            }
+        if (pending.isNotEmpty() && j.alive()) {
+            val parts = splitParts(pending, PART_ITEMS, PART_CHARS, MAX_PARTS)
             val latch = CountDownLatch(parts.size)
             for (i in parts.indices) {
                 val p = parts[i]
-                val strong = strongFlags[i]
                 val started = runBg {
                     try {
-                        runTextTask(j, p, strong, false, i)
+                        runTextTask(j, p, false)
                     } finally {
                         latch.countDown()
                     }
@@ -729,21 +747,20 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 if (!started) latch.countDown()
             }
             awaitLatch(latch, j)
-            var round = 0
-            while (round < FIX_ROUNDS && j.alive() && j.lines.get() > 0) {
-                val left = ArrayList<String>()
-                for (t in uniq) {
-                    if (left.size >= FIX_MAX) break
-                    if (!j.good.containsKey(t) && !allDead(j, t)) left.add(t)
-                }
-                if (left.isEmpty()) break
-                runTextTask(j, left, true, true, 20 + round)
-                round++
-            }
         }
-        awaitLatch(imageLatch, j)
+        awaitLatch(j.shotLatch, j)
+        if (j.alive() && j.lines.get() > 0) {
+            val left = ArrayList<String>()
+            for (it0 in j.items) {
+                if (left.size >= FIX_MAX) break
+                val t = it0.text
+                if (it0.dead || j.good.containsKey(t) || j.fixTried.contains(t) || left.contains(t)) continue
+                left.add(t)
+            }
+            if (left.isNotEmpty()) translateLoop(j, left, true, false)
+        }
+        if (read == null) j.endReason = END_NO_SCREEN
     }
-
     private fun allDead(j: Job, text: String): Boolean {
         for (it0 in j.items) {
             if (it0.text == text && !it0.dead) return false
@@ -799,35 +816,30 @@ class TranslatorAccessibilityService : AccessibilityService() {
         clearOverlay()
         setButtonColor(COLOR_IDLE)
         syncUiState()
-        when (j.endReason) {
-            END_OWN_APP -> toast(getString(R.string.msg_own_app))
-            END_NO_SCREEN -> toast(getString(R.string.msg_no_screen))
-            END_NO_TEXT -> {
-                saveError("")
-                toast(getString(R.string.msg_no_text))
-            }
-            else -> {
-                val code = j.lastCode
-                val noImages = synchronized(j.images) { j.images.isEmpty() }
-                if (j.items.isEmpty() && noImages && (code == 0 || code == 200)) {
-                    saveError("")
-                    toast(getString(R.string.msg_no_text))
-                } else if (j.saw429 && j.lines.get() == 0) {
-                    saveError("HTTP 429")
-                    toast(getString(R.string.msg_quota))
-                } else if (code == -1) {
-                    saveError(getString(R.string.err_net))
-                    toast(getString(R.string.msg_failed))
-                } else if (code != 0 && code != 200) {
-                    saveError("HTTP " + (if (code == 4290) 429 else code))
-                    toast(getString(R.string.msg_failed))
-                } else {
-                    toast(getString(R.string.msg_failed))
-                }
-            }
+        val code = j.lastCode
+        val noImages = synchronized(j.images) { j.images.isEmpty() }
+        val nothing = j.items.isEmpty() && noImages
+        if (j.endReason == END_OWN_APP) {
+            toast(getString(R.string.msg_own_app))
+        } else if (nothing && j.endReason == END_NO_SCREEN) {
+            toast(getString(R.string.msg_no_screen))
+        } else if (nothing && (code == 0 || code == 200)) {
+            saveError("")
+            toast(getString(R.string.msg_no_text))
+        } else if (j.saw429 && j.lines.get() == 0) {
+            saveError("HTTP 429")
+            logEvent("✗ সব key আর মডেলের লিমিট এখন শেষ, একটু পরে আবার চেষ্টা করুন")
+            toast(getString(R.string.msg_quota))
+        } else if (code == -1) {
+            saveError(getString(R.string.err_net))
+            toast(getString(R.string.msg_failed))
+        } else if (code != 0 && code != 200) {
+            saveError("HTTP " + (if (code == 4290) 429 else code))
+            toast(getString(R.string.msg_failed))
+        } else {
+            toast(getString(R.string.msg_failed))
         }
     }
-
     // ---------------------------------------------------------------------
     // Drawing
     // ---------------------------------------------------------------------
@@ -934,32 +946,69 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 }
                 l.add(f.rect)
             }
+            val used: MutableSet<Rect> = Collections.newSetFromMap(IdentityHashMap<Rect, Boolean>())
             var total = 0
             var dead = 0
+            var moved = 0
             var gone = 0
             for (it0 in j.items) {
+                if (it0.fromOcr) continue
                 total++
                 if (it0.dead) {
                     dead++
                     continue
                 }
-                if (!stillThere(it0, map)) {
+                val rs = map[it0.text]
+                var hit: Rect? = null
+                if (rs != null) {
+                    for (r in rs) {
+                        if (!used.contains(r) && isNear(r, it0.rect)) {
+                            hit = r
+                            break
+                        }
+                    }
+                }
+                if (hit != null) {
+                    used.add(hit)
+                    continue
+                }
+                var bestR: Rect? = null
+                var bestD = Long.MAX_VALUE
+                if (rs != null) {
+                    val cx = (it0.rect.left + it0.rect.right) / 2
+                    val cy = (it0.rect.top + it0.rect.bottom) / 2
+                    for (r in rs) {
+                        if (used.contains(r) || !sameSize(r, it0.rect)) continue
+                        val dx = ((r.left + r.right) / 2 - cx).toLong()
+                        val dy = ((r.top + r.bottom) / 2 - cy).toLong()
+                        val d = dx * dx + dy * dy
+                        if (d < bestD) {
+                            bestD = d
+                            bestR = r
+                        }
+                    }
+                }
+                val br = bestR
+                if (br != null) {
+                    used.add(br)
+                    it0.rect = Rect(br)
+                    moved++
+                } else {
                     it0.dead = true
                     dead++
                     gone++
                 }
             }
-            val hasImages = synchronized(j.images) { j.images.isNotEmpty() }
-            if (total == 0) {
-                if (hasImages) {
-                    clearAll()
-                    return
-                }
-            } else if (dead >= total || dead * 10 >= total * 7) {
+            if (total > 0 && dead * 10 >= total * 7) {
                 clearAll()
                 return
-            } else if (gone > 0) {
-                if (hasImages && dead * 2 >= total) {
+            }
+            if (moved + gone > 0) {
+                val liveBefore = total - (dead - gone)
+                if ((moved + gone) * 2 >= liveBefore) {
+                    for (it0 in j.items) {
+                        if (it0.fromOcr) it0.dead = true
+                    }
                     synchronized(j.images) { j.images.clear() }
                 }
                 requestDraw()
@@ -971,16 +1020,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun stillThere(it0: Item, map: HashMap<String, ArrayList<Rect>>): Boolean {
-        val rs = map[it0.text] ?: return false
-        for (r in rs) {
-            if (abs(r.left - it0.rect.left) <= 4 && abs(r.top - it0.rect.top) <= 4 &&
-                abs(r.right - it0.rect.right) <= 4 && abs(r.bottom - it0.rect.bottom) <= 4
-            ) return true
-        }
-        return false
+    private fun isNear(a: Rect, b: Rect): Boolean {
+        return abs(a.left - b.left) <= 4 && abs(a.top - b.top) <= 4 &&
+                abs(a.right - b.right) <= 4 && abs(a.bottom - b.bottom) <= 4
     }
 
+    private fun sameSize(a: Rect, b: Rect): Boolean {
+        val dw = abs(a.width() - b.width())
+        val dh = abs(a.height() - b.height())
+        return dw <= 12 + b.width() * 3 / 10 && dh <= 8 + b.height() * 3 / 10
+    }
     // ---------------------------------------------------------------------
     // Reading the screen
     // ---------------------------------------------------------------------
@@ -1190,11 +1239,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val paint = TextPaint()
         val out = ArrayList<Item>()
         for (f in limited) {
-            out.add(Item(f.text, Rect(f.rect), estimateSize(f.text, f.rect, paint), f.node))
+            out.add(Item(f.text, Rect(f.rect), estimateSize(f.text, f.rect, paint), f.node, false))
         }
         return out
     }
-
     private fun containsLoose(outer: Rect, inner: Rect): Boolean {
         return inner.left >= outer.left - 2 && inner.top >= outer.top - 2 &&
                 inner.right <= outer.right + 2 && inner.bottom <= outer.bottom + 2
@@ -1443,6 +1491,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val body = withoutUrls(t)
         var bn = 0
         var latin = 0
+        var foreign = 0
         for (ch in body) {
             if (!Character.isLetter(ch)) continue
             val c = ch.code
@@ -1451,12 +1500,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
             } else if (c < 0x0250) {
                 latin++
             } else {
-                return true
+                foreign++
             }
         }
-        return latin * 3 > bn
+        val all = bn + latin + foreign
+        if (foreign > 2 && foreign * 10 > all) return true
+        if (latin > 3 && latin * 3 > bn) return true
+        return false
     }
-
     private fun goodTr(src: String, tr: String): Boolean {
         val t = tr.trim()
         if (t.isEmpty()) return false
@@ -1552,11 +1603,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun isHardText(s: String): Boolean {
-        val c = scriptClass(s)
-        return c == 5 || c == 6 || c == 11
-    }
-
     private fun anyHan(list: List<String>): Boolean {
         for (x in list) {
             val c = scriptClass(x)
@@ -1624,10 +1670,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return sb.toString()
     }
 
-    private fun buildPrompt(texts: List<String>, appPkg: String, limits: Map<String, Int>, force: Boolean): String {
+    private fun buildPrompt(texts: List<String>, appPkg: String, limits: Map<String, Int>, force: Boolean, ocr: Boolean): String {
         val sb = StringBuilder()
         if (appPkg.isNotBlank()) {
             sb.append("All texts are from one screen of the phone app ").append(appPkg).append(", listed from top to bottom. Use them as context for each other.").append(NL)
+        }
+        if (ocr) {
+            sb.append("These texts were read from pictures or video frames on the screen by OCR, so they may contain small recognition mistakes. Understand what each one most likely says and translate that.").append(NL)
         }
         if (force) {
             sb.append("IMPORTANT: these texts were left untranslated or only partly translated before. Translate every single word of each one into Bengali now, so that no Chinese, English, Arabic or other foreign letters remain (only symbols, emojis, digits and URLs stay as they are).").append(NL)
@@ -1646,7 +1695,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         sb.append("Output nothing else: no explanations, no blank lines, no quotes, no markdown. Never merge two texts into one line and never split one text over two lines.").append(NL)
         return sb.toString()
     }
-
     private fun buildShotPrompt(known: List<String>, full: Boolean): String {
         val sb = StringBuilder()
         sb.append("This is a phone screenshot.").append(NL)
@@ -1676,20 +1724,29 @@ class TranslatorAccessibilityService : AccessibilityService() {
     // Text translation (streaming, one request for the whole screen)
     // ---------------------------------------------------------------------
 
-    private fun runTextTask(j: Job, texts: List<String>, strong: Boolean, force: Boolean, part: Int) {
+    private fun runTextTask(j: Job, texts: List<String>, ocr: Boolean) {
         if (texts.isEmpty()) return
-        val level = if (strong) HARD_THINKING else TEXT_THINKING
-        val models = if (strong) strongModels(j) else j.models
+        translateLoop(j, texts, false, ocr)
+        if (!j.alive() || j.lines.get() == 0) return
+        val left = ArrayList<String>()
+        for (t in texts) {
+            if (!j.good.containsKey(t) && !allDead(j, t)) left.add(t)
+        }
+        if (left.isNotEmpty()) translateLoop(j, left, true, ocr)
+    }
+
+    private fun translateLoop(j: Job, texts: List<String>, force: Boolean, ocr: Boolean) {
+        val models = j.models
         val tried = HashSet<String>()
         val answered: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        if (force) j.fixTried.addAll(texts)
         var pending: List<String> = texts.filter { !j.good.containsKey(it) }
         var groups = 0
         while (j.alive() && pending.isNotEmpty() && groups < MAX_GROUPS) {
             groups++
-            val order = comboOrder(j, models, part)
-            val res = runGroup(j, pending, force, level, order, tried, answered)
+            val res = runGroup(j, pending, force, ocr, models, tried, answered)
             if (res.completed) break
-            if (res.lines == 0 && !hasUntried(order, tried)) break
+            if (res.lines == 0 && res.noMore) break
             val next = ArrayList<String>()
             for (t in pending) {
                 if (!answered.contains(t) && !j.good.containsKey(t)) next.add(t)
@@ -1697,40 +1754,31 @@ class TranslatorAccessibilityService : AccessibilityService() {
             pending = next
         }
     }
-
-    private fun hasUntried(order: List<Combo>, tried: Set<String>): Boolean {
-        for (c in order) {
-            if (!tried.contains(c.tag)) return true
-        }
-        return false
-    }
-
-    private fun runGroup(j: Job, texts: List<String>, force: Boolean, level: String, order: List<Combo>,
+    private fun runGroup(j: Job, texts: List<String>, force: Boolean, ocr: Boolean, models: List<String>,
                          tried: MutableSet<String>, answered: MutableSet<String>): GroupResult {
         val sys = buildSystem(texts)
-        val prompt = buildPrompt(texts, j.appPkg, j.limits, force)
+        val prompt = buildPrompt(texts, j.appPkg, j.limits, force, ocr)
+        val level = TEXT_THINKING
         val live = ArrayList<Attempt>()
+        var noMore = false
 
         fun launchNext(): Boolean {
-            if (live.size >= MAX_ATTEMPTS) return false
-            for (c in order) {
-                if (tried.contains(c.tag)) continue
-                tried.add(c.tag)
-                if (j.badCombos.contains(c.tag)) continue
-                val a = Attempt(c, SystemClock.uptimeMillis())
-                j.slots.add(a.slot)
-                live.add(a)
-                val ok = runBg { runTextAttempt(j, a, texts, sys, prompt, level, answered) }
-                if (!ok) {
-                    a.code = -1
-                    a.done = true
-                }
-                return true
+            if (live.size >= MAX_ATTEMPTS || j.attempts.get() >= JOB_MAX_ATTEMPTS) return false
+            val c = pickNext(j, models, tried) ?: return false
+            tried.add(c.tag)
+            j.attempts.incrementAndGet()
+            val a = Attempt(c, SystemClock.uptimeMillis())
+            j.slots.add(a.slot)
+            live.add(a)
+            val ok = runBg { runTextAttempt(j, a, texts, sys, prompt, level, answered) }
+            if (!ok) {
+                a.code = -1
+                a.done = true
             }
-            return false
+            return true
         }
 
-        if (!launchNext()) return GroupResult(0, false)
+        if (!launchNext()) return GroupResult(0, false, true)
         while (j.alive()) {
             try {
                 Thread.sleep(POLL_MS)
@@ -1767,19 +1815,29 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     }
                 }
                 for (a in live) {
-                    if (!a.done && a.lines > 0 && now - a.lastAt > STALL_MS) a.slot.cancel()
+                    if (!a.done && a.lines > 0 && !a.slot.cancelled && now - a.lastAt > STALL_MS) {
+                        logEvent("⏸ " + comboName(j, a.combo) + " — মাঝপথে থেমে গেছে, বাকি লেখা পরেরটায়")
+                        a.slot.cancel()
+                        markSlow(a.combo)
+                    }
                 }
             }
             if (active == 0) {
                 if (streaming != null) break
-                if (!launchNext()) break
+                if (!launchNext()) {
+                    noMore = true
+                    break
+                }
                 continue
             }
             if (streaming == null && newest != null) {
                 val waited = now - newest.startAt
-                if (waited > firstLineLimit(newest.combo.model, level)) {
+                if (waited > firstLineLimit(newest.combo.model)) {
                     if (active < MAX_LIVE) {
-                        launchNext()
+                        if (launchNext() && !newest.flagged) {
+                            newest.flagged = true
+                            logEvent("⏱ " + comboName(j, newest.combo) + " — " + waited / 1000L + " সেকেন্ডে উত্তর আসেনি, পাশাপাশি পরেরটায় পাঠানো হলো")
+                        }
                     } else if (oldest != null && now - oldest.startAt > FIRST_LINE_MAX_MS) {
                         oldest.slot.cancel()
                         markSlow(oldest.combo)
@@ -1796,9 +1854,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
             lines += a.lines
             if (a.done && a.code == 200 && a.lines > 0) completed = true
         }
-        return GroupResult(lines, completed)
+        return GroupResult(lines, completed, noMore)
     }
-
     private fun runTextAttempt(j: Job, a: Attempt, texts: List<String>, sys: String, prompt: String,
                                level: String, answered: MutableSet<String>) {
         var code = -1
@@ -1822,20 +1879,19 @@ class TranslatorAccessibilityService : AccessibilityService() {
             }
         }
         if (code != 200 && code != -2) {
-            markBad(j, a.combo, code)
+            markBad(j, a, code)
             noteCode(j, code)
         }
         a.code = code
         a.done = true
     }
-
     private fun onLine(j: Job, a: Attempt, texts: List<String>, n: Int, tr: String, answered: MutableSet<String>) {
         if (n < 1 || n > texts.size) return
         val src = texts[n - 1]
         val now = SystemClock.uptimeMillis()
         if (a.lines == 0) {
             recordFirst(a.combo.model, now - a.startAt)
-            saveCurrentCombo(a.combo)
+            saveCurrentCombo(j, a.combo)
         }
         a.lines = a.lines + 1
         a.lastAt = now
@@ -1856,7 +1912,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         requestDraw()
     }
-
     private fun parseLine(raw: String): Pair<Int, String>? {
         var s = raw.trim()
         while (s.isNotEmpty() && (s[0] == '*' || s[0] == '-' || s[0] == '`' || s[0] == '>' || s[0] == '#')) {
@@ -1904,9 +1959,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
     // Text inside pictures (screenshot), only when it is needed
     // ---------------------------------------------------------------------
 
-    private fun captureForJob(j: Job, latch: CountDownLatch) {
-        if (job !== j || !j.alive() || !uiReady) {
-            latch.countDown()
+    private fun captureForJob(j: Job) {
+        if (!uiReady) {
+            j.shotLatch.countDown()
             openGate(j)
             return
         }
@@ -1914,34 +1969,36 @@ class TranslatorAccessibilityService : AccessibilityService() {
         captureStartedAt = SystemClock.uptimeMillis()
         buttonView?.visibility = View.GONE
         handler.postDelayed({
-            captureScreen { b64 ->
+            captureScreen { bmp ->
                 capturing = false
-                if (job === j) syncUiState()
+                syncUiState()
                 openGate(j)
-                if (b64 != null && j.alive()) {
-                    val ok = runBg {
-                        try {
-                            runImageTask(j, b64)
-                        } finally {
-                            latch.countDown()
-                        }
+                if (bmp != null && j.alive()) {
+                    val ok = runBg { processShot(j, bmp) }
+                    if (!ok) {
+                        recycleBmp(bmp)
+                        j.shotLatch.countDown()
                     }
-                    if (!ok) latch.countDown()
                 } else {
-                    latch.countDown()
+                    if (bmp != null) recycleBmp(bmp)
+                    j.shotLatch.countDown()
                 }
             }
-        }, 120)
+        }, SHOT_DELAY_MS)
     }
 
-    private fun captureScreen(done: (String?) -> Unit) {
+    private fun captureScreen(done: (Bitmap?) -> Unit) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             done(null)
             return
         }
         val fired = AtomicBoolean(false)
-        val finishOnce: (String?) -> Unit = { value ->
-            if (fired.compareAndSet(false, true)) done(value)
+        val finishOnce: (Bitmap?) -> Unit = { value ->
+            if (fired.compareAndSet(false, true)) {
+                done(value)
+            } else if (value != null) {
+                recycleBmp(value)
+            }
         }
         handler.postDelayed({ finishOnce(null) }, 4000)
         try {
@@ -1949,27 +2006,21 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 object : AccessibilityService.TakeScreenshotCallback {
                     override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
                         val ok = runBg {
-                            var b64: String? = null
+                            var soft: Bitmap? = null
                             try {
                                 val hb: HardwareBuffer = screenshot.hardwareBuffer
                                 val rawBmp = Bitmap.wrapHardwareBuffer(hb, screenshot.colorSpace)
                                 if (rawBmp != null) {
-                                    val soft = rawBmp.copy(Bitmap.Config.ARGB_8888, false)
+                                    soft = rawBmp.copy(Bitmap.Config.ARGB_8888, false)
                                     try {
                                         rawBmp.recycle()
                                     } catch (e: Throwable) { }
-                                    if (soft != null) {
-                                        b64 = encodeShot(soft)
-                                        try {
-                                            soft.recycle()
-                                        } catch (e: Throwable) { }
-                                    }
                                 }
                                 try {
                                     hb.close()
                                 } catch (e: Throwable) { }
                             } catch (e: Throwable) { }
-                            val result = b64
+                            val result = soft
                             handler.post { finishOnce(result) }
                         }
                         if (!ok) finishOnce(null)
@@ -1984,6 +2035,189 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun recycleBmp(b: Bitmap?) {
+        try {
+            b?.recycle()
+        } catch (e: Throwable) { }
+    }
+
+    private fun processShot(j: Job, bmp: Bitmap) {
+        try {
+            var boxes: List<OcrBox> = emptyList()
+            var ocrOk = false
+            try {
+                boxes = runOcr(bmp)
+                ocrOk = true
+            } catch (t: Throwable) { }
+            val t0 = SystemClock.uptimeMillis()
+            while (!j.itemsReady && j.alive() && SystemClock.uptimeMillis() - t0 < 3000L) {
+                try {
+                    Thread.sleep(20)
+                } catch (e: InterruptedException) {
+                    break
+                }
+            }
+            if (!j.alive() || j.endReason == END_OWN_APP) return
+            val base = j.items
+            val extra = filterOcr(boxes, base)
+            val needGemini = (j.hasArabic && j.media) || (!ocrOk && (base.size < 4 || j.media)) ||
+                    (base.size < 4 && extra.size < 2)
+            var b64: String? = null
+            if (needGemini) b64 = encodeShot(bmp)
+            recycleBmp(bmp)
+            val pending = ArrayList<String>()
+            if (extra.isNotEmpty()) {
+                synchronized(j.itemsLock) { j.items = j.items + extra }
+                val texts = LinkedHashSet<String>()
+                for (it0 in extra) {
+                    texts.add(it0.text)
+                    val lim = limitOf(it0)
+                    val old = j.limits[it0.text]
+                    if (old == null || lim < old) j.limits[it0.text] = lim
+                }
+                for (t in texts) {
+                    val c = cacheGet(t)
+                    if (c != null) j.good[t] = c else pending.add(t)
+                }
+                requestDraw()
+            }
+            val img = b64
+            if (img != null && j.alive()) {
+                val l2 = CountDownLatch(1)
+                val ok = runBg {
+                    try {
+                        runImageTask(j, img)
+                    } finally {
+                        l2.countDown()
+                    }
+                }
+                if (!ok) l2.countDown()
+                if (pending.isNotEmpty()) runTextTask(j, pending, true)
+                awaitLatch(l2, j)
+            } else if (pending.isNotEmpty()) {
+                runTextTask(j, pending, true)
+            }
+        } catch (t: Throwable) {
+        } finally {
+            recycleBmp(bmp)
+            j.shotLatch.countDown()
+        }
+    }
+
+    private fun ocrClient(): TextRecognizer? {
+        if (ocrBroken) return null
+        synchronized(ocrLock) {
+            var c = recognizer
+            if (c == null) {
+                c = try {
+                    TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+                } catch (t: Throwable) {
+                    ocrBroken = true
+                    null
+                }
+                recognizer = c
+            }
+            return c
+        }
+    }
+
+    private fun runOcr(bmp: Bitmap): List<OcrBox> {
+        val client = ocrClient() ?: throw IllegalStateException("no ocr")
+        val image = InputImage.fromBitmap(bmp, 0)
+        val result: Text = Tasks.await(client.process(image), OCR_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        val out = ArrayList<OcrBox>()
+        for (block in result.textBlocks) {
+            val box = block.boundingBox ?: continue
+            val sb = StringBuilder()
+            var count = 0
+            for (line in block.lines) {
+                val lt = line.text
+                if (lt.isNullOrBlank()) continue
+                if (sb.isNotEmpty()) sb.append(' ')
+                sb.append(lt)
+                count++
+            }
+            if (sb.isEmpty()) continue
+            if (count < 1) count = 1
+            var size = box.height().toFloat() / count.toFloat() * 0.8f
+            if (size < 1f) size = 1f
+            out.add(OcrBox(sb.toString(), Rect(box), size))
+        }
+        return out
+    }
+
+    private fun prewarmOcr() {
+        try {
+            val b = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888)
+            try {
+                runOcr(b)
+            } finally {
+                recycleBmp(b)
+            }
+        } catch (t: Throwable) { }
+    }
+
+    private fun filterOcr(boxes: List<OcrBox>, base: List<Item>): List<Item> {
+        val out = ArrayList<Item>()
+        if (boxes.isEmpty()) return out
+        val screen = Rect(0, 0, screenWidth, screenHeight)
+        val sorted = boxes.sortedWith(Comparator { a, b ->
+            if (a.rect.top != b.rect.top) a.rect.top - b.rect.top else a.rect.left - b.rect.left
+        })
+        for (b in sorted) {
+            if (out.size >= OCR_MAX) break
+            var t = cleanText(b.text)
+            if (t.isEmpty()) continue
+            if (!hasTranslatable(t) || isLiteral(t) || isLoneLatin(t)) continue
+            if (!ocrPlausible(t)) continue
+            val r = Rect(b.rect)
+            if (!r.intersect(screen)) continue
+            if (r.width() < minBoxWidth || r.height() < minBoxHeight) continue
+            var clash = false
+            for (it0 in base) {
+                if (overlapPercent(r, it0.rect) > 30 || overlapPercent(it0.rect, r) > 60) {
+                    clash = true
+                    break
+                }
+            }
+            if (!clash) {
+                for (o in out) {
+                    if (overlapPercent(r, o.rect) > 40) {
+                        clash = true
+                        break
+                    }
+                }
+            }
+            if (clash) continue
+            if (t.length > MAX_TEXT_LEN) t = t.substring(0, MAX_TEXT_LEN)
+            out.add(Item(t, r, b.size, null, true))
+        }
+        return out
+    }
+
+    private fun ocrPlausible(t: String): Boolean {
+        var han = 0
+        var latin = 0
+        var vowels = 0
+        var other = 0
+        for (ch in t) {
+            if (!Character.isLetter(ch)) continue
+            val c = ch.code
+            if ((c in 0x4E00..0x9FFF) || (c in 0x3400..0x4DBF)) {
+                han++
+            } else if (c < 0x0250) {
+                latin++
+                if ("aeiouyAEIOUY".indexOf(ch) >= 0) vowels++
+            } else {
+                other++
+            }
+        }
+        if (han >= 2) return true
+        if (latin >= 3 && vowels >= 1) return true
+        if (han == 1 && latin >= 2) return true
+        if (other >= 2) return true
+        return false
+    }
     private fun encodeShot(src: Bitmap): String? {
         try {
             val w = src.width
@@ -2024,26 +2258,24 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         val full = j.items.size < 4
         val prompt = buildShotPrompt(known, full)
-        val order = comboOrder(j, imageModels(j), 3)
+        val models = imageModels(j)
         val tried = HashSet<String>()
         val live = ArrayList<Attempt>()
 
         fun launchNext(): Boolean {
-            for (c in order) {
-                if (tried.contains(c.tag)) continue
-                tried.add(c.tag)
-                if (j.badCombos.contains(c.tag)) continue
-                val a = Attempt(c, SystemClock.uptimeMillis())
-                j.slots.add(a.slot)
-                live.add(a)
-                val ok = runBg { runImageAttempt(j, a, prompt, b64) }
-                if (!ok) {
-                    a.code = -1
-                    a.done = true
-                }
-                return true
+            if (live.size >= MAX_ATTEMPTS || j.attempts.get() >= JOB_MAX_ATTEMPTS) return false
+            val c = pickNext(j, models, tried) ?: return false
+            tried.add(c.tag)
+            j.attempts.incrementAndGet()
+            val a = Attempt(c, SystemClock.uptimeMillis())
+            j.slots.add(a.slot)
+            live.add(a)
+            val ok = runBg { runImageAttempt(j, a, prompt, b64) }
+            if (!ok) {
+                a.code = -1
+                a.done = true
             }
-            return false
+            return true
         }
 
         if (!launchNext()) return
@@ -2085,9 +2317,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
         if (!j.alive()) return
         val found = parseShot(result)
         val accepted = ArrayList<ImgEntry>()
+        val items = j.items
         for (im in found) {
             var clash = false
-            for (it0 in j.items) {
+            for (it0 in items) {
                 if (overlapPercent(im.rect, it0.rect) > 25) {
                     clash = true
                     break
@@ -2117,15 +2350,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
             code = -1
         }
         if (a.slot.cancelled) code = -2
-        if (code == 200) saveCurrentCombo(a.combo)
+        if (code == 200) saveCurrentCombo(j, a.combo)
         if (code != 200 && code != -2) {
-            markBad(j, a.combo, code)
+            markBad(j, a, code)
             noteCode(j, code)
         }
         a.code = code
         a.done = true
     }
-
     private fun trimJson(s: String): String {
         var t = s.trim()
         val a = t.indexOf('{')
@@ -2306,6 +2538,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
                     } catch (e: Throwable) {
                         null
                     }
+                    if (code == 429) a.retryMs = retryDelayMs(err)
                     return mapError(code, err)
                 }
                 if (!stream) {
@@ -2329,7 +2562,11 @@ class TranslatorAccessibilityService : AccessibilityService() {
                         null
                     } ?: continue
                     val err = obj.optJSONObject("error")
-                    if (err != null) return mapError(err.optInt("code", 500), payload)
+                    if (err != null) {
+                        val ec = err.optInt("code", 500)
+                        if (ec == 429) a.retryMs = retryDelayMs(payload)
+                        return mapError(ec, payload)
+                    }
                     val piece = extractText(obj)
                     if (piece.isEmpty()) continue
                     buf.append(piece)
@@ -2348,7 +2585,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
             return if (slot.cancelled) -2 else -1
         }
     }
-
     private fun warmConnection() {
         try {
             lastNetAt = System.currentTimeMillis()
@@ -2391,53 +2627,104 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return code
     }
 
+    private fun retryDelayMs(body: String?): Long {
+        if (body == null) return -1L
+        try {
+            val o = JSONObject(body)
+            val err = o.optJSONObject("error") ?: o
+            val details = err.optJSONArray("details") ?: return -1L
+            for (i in 0 until details.length()) {
+                val d = details.optJSONObject(i) ?: continue
+                val rd = d.optString("retryDelay", "").trim()
+                if (rd.isEmpty()) continue
+                val num = if (rd.endsWith("s")) rd.substring(0, rd.length - 1) else rd
+                val v = num.toDoubleOrNull() ?: continue
+                return (v * 1000.0).toLong()
+            }
+        } catch (t: Throwable) { }
+        return -1L
+    }
+
     // ---------------------------------------------------------------------
     // Keys, models, speed and rest times
     // ---------------------------------------------------------------------
 
-    private fun comboOrder(j: Job, models: List<String>, offset: Int): List<Combo> {
+    private fun pickNext(j: Job, models: List<String>, tried: Set<String>): Combo? {
         val now = System.currentTimeMillis()
-        val ready = ArrayList<Combo>()
-        val cooled = ArrayList<Pair<Combo, Long>>()
-        val ks = j.keys
-        if (ks.isEmpty()) return ready
-        for (m in models) {
-            for (k in ks.indices) {
-                val key = ks[(j.turn + offset + k) % ks.size]
-                val c = Combo(key, m)
-                if (j.badCombos.contains(c.tag)) continue
+        var best: Combo? = null
+        var bestScore = Long.MAX_VALUE
+        var bestUntil = 0L
+        for (mi in models.indices) {
+            val m = models[mi]
+            val suspect = isSuspect(m, j.keys.size, now)
+            for (ki in j.keys.indices) {
+                val c = Combo(j.keys[ki], m)
+                if (tried.contains(c.tag) || j.badCombos.contains(c.tag)) continue
                 val until = synchronized(comboLock) { cooldown[c.tag] ?: 0L }
-                if (until > now) cooled.add(Pair(c, until)) else ready.add(c)
+                var s = mi.toLong() * 100L + ki.toLong()
+                if (suspect) s += 10000L
+                if (until > now) s += 1000000L + (until - now) / 1000L
+                if (s < bestScore) {
+                    best = c
+                    bestScore = s
+                    bestUntil = until
+                }
             }
         }
-        if (ready.isEmpty()) {
-            cooled.sortBy { it.second }
-            for (p in cooled) {
-                if (ready.size >= 2) break
-                if (p.second - now <= 70000L) ready.add(p.first)
-            }
+        val b = best ?: return null
+        if (bestUntil > now) {
+            if (bestUntil - now > 65000L) return null
+            if (j.coolTries.incrementAndGet() > 2) return null
+        } else if (bestScore >= 10000L) {
+            if (j.coolTries.incrementAndGet() > 2) return null
         }
-        return ready
+        return b
     }
 
-    private fun markBad(j: Job, c: Combo, code: Int) {
-        val ms = when {
-            code == 4290 -> 3600000L
-            code == 429 -> 60000L
+    private fun isSuspect(model: String, keyCount: Int, now: Long): Boolean {
+        synchronized(comboLock) {
+            val m = model429[model] ?: return false
+            var n = 0
+            for (t in m.values) {
+                if (now - t < SUSPECT_MS) n++
+            }
+            val need = if (keyCount < 2) 1 else 2
+            return n >= need
+        }
+    }
+    private fun markBad(j: Job, a: Attempt, code: Int) {
+        val c = a.combo
+        val now = System.currentTimeMillis()
+        var rest = when {
+            code == 4290 -> nextPacificMidnight() - now
+            code == 429 -> if (a.retryMs > 0L) a.retryMs + 1000L else 60000L
             code == 401 || code == 403 || code == 404 -> 600000L
             code >= 500 -> 15000L
             code == -1 -> 8000L
             else -> 20000L
         }
+        if (code == 429) {
+            if (rest < 5000L) rest = 5000L
+            if (rest > 120000L) rest = 120000L
+        }
+        if (rest < 1000L) rest = 1000L
+        val until = now + rest
         synchronized(comboLock) {
-            val until = System.currentTimeMillis() + ms
             val old = cooldown[c.tag] ?: 0L
             if (until > old) cooldown[c.tag] = until
+            if (code == 429 || code == 4290) {
+                var m = model429[c.model]
+                if (m == null) {
+                    m = HashMap()
+                    model429[c.model] = m
+                }
+                m[c.key] = now
+            }
         }
         j.badCombos.add(c.tag)
         if (code == 404) markDead(c.model)
+        logEvent("✗ " + comboName(j, c) + " — " + reasonText(code, rest, until))
     }
-
     private fun markSlow(c: Combo) {
         synchronized(comboLock) {
             val until = System.currentTimeMillis() + 15000L
@@ -2451,35 +2738,19 @@ class TranslatorAccessibilityService : AccessibilityService() {
         j.lastCode = code
     }
 
-    private fun firstLineLimit(model: String, level: String): Long {
+    private fun firstLineLimit(model: String): Long {
         val base = synchronized(speedLock) { firstLat[model] }
-        var t = if (base != null) {
-            (base * 2.2).toLong() + 1500L
-        } else if (level == TEXT_THINKING) {
-            FIRST_LINE_MS
-        } else {
-            FIRST_LINE_HARD_MS
-        }
+        var t = if (base != null) (base * 2.0).toLong() else FIRST_LINE_LIMIT_MS
         if (t < FIRST_LINE_MIN_MS) t = FIRST_LINE_MIN_MS
-        if (t > FIRST_LINE_MAX_MS) t = FIRST_LINE_MAX_MS
+        if (t > FIRST_LINE_LIMIT_MS) t = FIRST_LINE_LIMIT_MS
         return t
     }
-
     private fun recordFirst(model: String, ms: Long) {
         if (ms <= 0L) return
         synchronized(speedLock) {
             val old = firstLat[model]
             firstLat[model] = if (old == null) ms.toDouble() else old * 0.6 + ms.toDouble() * 0.4
         }
-    }
-
-    private fun strongModels(j: Job): List<String> {
-        if (j.auto) return deadLast(HARD_PREF)
-        val out = ArrayList<String>()
-        for (m in HARD_PREF) {
-            if (j.models.contains(m)) out.add(m)
-        }
-        return if (out.isEmpty()) j.models else out
     }
 
     private fun imageModels(j: Job): List<String> {
@@ -2520,17 +2791,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
         try {
             prefs().edit().remove("lvl_" + tag).apply()
         } catch (e: Exception) { }
-    }
-
-    private fun getKeys(): List<String> {
-        val p = prefs()
-        return listOf(
-            p.getString("key1", "") ?: "",
-            p.getString("key2", "") ?: "",
-            p.getString("key3", "") ?: "",
-            p.getString("key4", "") ?: "",
-            p.getString("key5", "") ?: ""
-        ).map { it.trim() }.filter { it.isNotBlank() }.distinct()
     }
 
     private fun getModels(auto: Boolean): List<String> {
@@ -2623,17 +2883,80 @@ class TranslatorAccessibilityService : AccessibilityService() {
         return out
     }
 
-    private fun saveCurrentCombo(c: Combo) {
-        if (lastComboSaved == c.tag) return
-        lastComboSaved = c.tag
+    private fun saveCurrentCombo(j: Job, c: Combo) {
+        synchronized(logLock) {
+            if (lastComboSaved == c.tag) return
+            lastComboSaved = c.tag
+        }
+        val name = j.keyNames[c.key] ?: "Key"
         try {
             prefs().edit()
-                .putString("currentKey", c.key.take(8) + "...")
+                .putString("currentKey", c.key.take(8) + "... (" + name + ")")
                 .putString("currentModel", c.model)
                 .apply()
         } catch (e: Exception) { }
+        logEvent("→ এখন " + comboName(j, c) + " দিয়ে অনুবাদ হচ্ছে")
     }
 
+    private fun comboName(j: Job, c: Combo): String {
+        return (j.keyNames[c.key] ?: "Key") + " · " + c.model
+    }
+
+    private fun logEvent(msg: String) {
+        try {
+            val line = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + "  " + msg
+            synchronized(logLock) {
+                val p = prefs()
+                val old = p.getString("switchLog", "") ?: ""
+                val sb = StringBuilder(line)
+                var n = 1
+                for (l in old.split(NL)) {
+                    if (n >= LOG_MAX) break
+                    if (l.isBlank()) continue
+                    sb.append(NL).append(l)
+                    n++
+                }
+                p.edit().putString("switchLog", sb.toString()).apply()
+            }
+        } catch (e: Throwable) { }
+    }
+
+    private fun reasonText(code: Int, restMs: Long, until: Long): String {
+        val secs = (restMs + 999L) / 1000L
+        return when {
+            code == 4290 -> "আজকের লিমিট শেষ, " + clock(until) + " পর্যন্ত বাদ"
+            code == 429 -> "মিনিটের লিমিট শেষ, " + secs + " সেকেন্ড বিশ্রাম"
+            code == 401 || code == 403 -> "key কাজ করছে না (" + code + "), 10 মিনিট বাদ"
+            code == 404 -> "মডেল পাওয়া যায়নি (404), 10 মিনিট বাদ"
+            code >= 500 -> "Google সার্ভার ব্যস্ত (" + code + "), " + secs + " সেকেন্ড বিশ্রাম"
+            code == -1 -> "নেট সমস্যা, " + secs + " সেকেন্ড বিশ্রাম"
+            code == 204 -> "খালি উত্তর এসেছে, " + secs + " সেকেন্ড বিশ্রাম"
+            code == 400 -> "অনুরোধ নেয়নি (400), " + secs + " সেকেন্ড বিশ্রাম"
+            else -> "সমস্যা (" + code + "), " + secs + " সেকেন্ড বিশ্রাম"
+        }
+    }
+
+    private fun clock(ms: Long): String {
+        return try {
+            SimpleDateFormat("HH:mm", Locale.US).format(Date(ms))
+        } catch (e: Throwable) {
+            ""
+        }
+    }
+
+    private fun nextPacificMidnight(): Long {
+        return try {
+            val cal = Calendar.getInstance(TimeZone.getTimeZone("America/Los_Angeles"))
+            cal.add(Calendar.DAY_OF_YEAR, 1)
+            cal.set(Calendar.HOUR_OF_DAY, 0)
+            cal.set(Calendar.MINUTE, 0)
+            cal.set(Calendar.SECOND, 30)
+            cal.set(Calendar.MILLISECOND, 0)
+            cal.timeInMillis
+        } catch (e: Throwable) {
+            System.currentTimeMillis() + 3600000L
+        }
+    }
     // ---------------------------------------------------------------------
     // Saved translations (memory book)
     // ---------------------------------------------------------------------
@@ -2790,6 +3113,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
         removeViews()
         unregister()
         try {
+            synchronized(ocrLock) {
+                recognizer?.close()
+                recognizer = null
+            }
+        } catch (e: Throwable) { }
+        try {
             pool.shutdown()
         } catch (e: Throwable) { }
         super.onDestroy()
@@ -2804,27 +3133,26 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val ST_SHOWN = 2
         private const val END_NO_SCREEN = 1
         private const val END_OWN_APP = 2
-        private const val END_NO_TEXT = 3
         private const val MAX_VISIT = 4000
         private const val MAX_FOUND = 500
         private const val MAX_ITEMS = 200
         private const val MAX_TEXT_LEN = 1200
-        private const val PART_ITEMS = 45
-        private const val PART_CHARS = 3500
+        private const val PART_ITEMS = 16
+        private const val PART_CHARS = 900
         private const val MAX_PARTS = 3
-        private const val HARD_PART_ITEMS = 40
-        private const val HARD_PART_CHARS = 3000
-        private const val FIX_ROUNDS = 2
         private const val FIX_MAX = 80
         private const val MAX_GROUPS = 4
         private const val MAX_LIVE = 2
-        private const val MAX_ATTEMPTS = 10
+        private const val MAX_ATTEMPTS = 8
+        private const val JOB_MAX_ATTEMPTS = 24
+        private const val OCR_MAX = 40
+        private const val OCR_TIMEOUT_MS = 4000L
+        private const val SHOT_DELAY_MS = 100L
         private const val CACHE_MAX = 1500
         private const val CACHE_FILE = "tr_cache_wb.json"
         private const val OLD_CACHE_FILE = "tr_cache.json"
         private const val TEXT_THINKING = "minimal"
-        private const val HARD_THINKING = "low"
-        private const val SHOT_THINKING = "low"
+        private const val SHOT_THINKING = "minimal"
         private const val COLOR_IDLE = "#2196F3"
         private const val COLOR_BUSY = "#FF9800"
         private const val COLOR_DONE = "#4CAF50"
@@ -2834,12 +3162,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val DRAW_GATE_MS = 1500L
         private const val DRAW_THROTTLE_MS = 90L
         private const val VERIFY_DELAY_MS = 300L
-        private const val FIRST_LINE_MS = 5000L
-        private const val FIRST_LINE_HARD_MS = 10000L
-        private const val FIRST_LINE_MIN_MS = 3500L
-        private const val FIRST_LINE_MAX_MS = 14000L
-        private const val STALL_MS = 5000L
-        private const val IMAGE_HEDGE_MS = 15000L
+        private const val FIRST_LINE_LIMIT_MS = 2000L
+        private const val FIRST_LINE_MIN_MS = 1500L
+        private const val FIRST_LINE_MAX_MS = 4000L
+        private const val STALL_MS = 2000L
+        private const val IMAGE_HEDGE_MS = 8000L
+        private const val SUSPECT_MS = 90000L
+        private const val LOG_MAX = 150
         private const val POLL_MS = 60L
         private const val WARM_AFTER_MS = 240000L
         private const val SPEED_STALE_MS = 1800000L
@@ -2855,13 +3184,6 @@ class TranslatorAccessibilityService : AccessibilityService() {
             "gemini-3-flash-preview",
             "gemini-3.8-flash",
             "gemini-3.6-flash"
-        )
-        private val HARD_PREF = listOf(
-            "gemini-3.6-flash",
-            "gemini-3.8-flash",
-            "gemini-3-flash-preview",
-            "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite"
         )
         private val IMAGE_PREF = listOf(
             "gemini-3.5-flash-lite",
