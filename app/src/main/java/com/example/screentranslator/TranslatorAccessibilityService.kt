@@ -242,6 +242,8 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private class GroupResult(val lines: Int, val completed: Boolean, val noMore: Boolean)
 
+    private class Pick(val combo: Combo, val until: Long, val suspect: Boolean)
+
     private class WalkCtx(val out: ArrayList<Found>, val screen: Rect, val covers: List<Rect>,
                           val full: Boolean, val screenArea: Long, val screenH: Int) {
         var visited = 0
@@ -258,10 +260,12 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val limits = ConcurrentHashMap<String, Int>()
         val images: MutableList<ImgEntry> = Collections.synchronizedList(ArrayList<ImgEntry>())
         val badCombos: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+        val transient: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
         val fixTried: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
         val lines = AtomicInteger(0)
         val attempts = AtomicInteger(0)
         val coolTries = AtomicInteger(0)
+        val netFails = AtomicInteger(0)
         val shotLatch = CountDownLatch(1)
         val itemsLock = Any()
         @Volatile var items: List<Item> = emptyList()
@@ -312,8 +316,9 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private val speedLock = Any()
     private val speedVal = HashMap<String, Double>()
     private val speedAt = HashMap<String, Long>()
-    private val firstLat = HashMap<String, Double>()
     private val model429 = HashMap<String, HashMap<String, Long>>()
+    private val modelBusy = HashMap<String, Long>()
+    private val busyCount = HashMap<String, Int>()
     private val logLock = Any()
     private val ocrLock = Any()
     private var recognizer: TextRecognizer? = null
@@ -1737,7 +1742,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
 
     private fun translateLoop(j: Job, texts: List<String>, force: Boolean, ocr: Boolean) {
         val models = j.models
-        val tried = HashSet<String>()
+        val tried = HashMap<String, Int>()
         val answered: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
         if (force) j.fixTried.addAll(texts)
         var pending: List<String> = texts.filter { !j.good.containsKey(it) }
@@ -1755,17 +1760,20 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
     }
     private fun runGroup(j: Job, texts: List<String>, force: Boolean, ocr: Boolean, models: List<String>,
-                         tried: MutableSet<String>, answered: MutableSet<String>): GroupResult {
+                         tried: MutableMap<String, Int>, answered: MutableSet<String>): GroupResult {
         val sys = buildSystem(texts)
         val prompt = buildPrompt(texts, j.appPkg, j.limits, force, ocr)
         val level = TEXT_THINKING
         val live = ArrayList<Attempt>()
         var noMore = false
+        var hedges = 0
+        var waitUntil = 0L
+        var hedgeCheckAt = 0L
+        var firstRound = true
 
-        fun launchNext(): Boolean {
-            if (live.size >= MAX_ATTEMPTS || j.attempts.get() >= JOB_MAX_ATTEMPTS) return false
-            val c = pickNext(j, models, tried) ?: return false
-            tried.add(c.tag)
+        fun start(c: Combo) {
+            tried[c.tag] = (tried[c.tag] ?: 0) + 1
+            j.transient.remove(c.tag)
             j.attempts.incrementAndGet()
             val a = Attempt(c, SystemClock.uptimeMillis())
             j.slots.add(a.slot)
@@ -1775,16 +1783,17 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 a.code = -1
                 a.done = true
             }
-            return true
         }
 
-        if (!launchNext()) return GroupResult(0, false, true)
         while (j.alive()) {
-            try {
-                Thread.sleep(POLL_MS)
-            } catch (e: InterruptedException) {
-                break
+            if (!firstRound) {
+                try {
+                    Thread.sleep(POLL_MS)
+                } catch (e: InterruptedException) {
+                    break
+                }
             }
+            firstRound = false
             var all = true
             for (t in texts) {
                 if (!answered.contains(t)) {
@@ -1796,52 +1805,73 @@ class TranslatorAccessibilityService : AccessibilityService() {
             val now = SystemClock.uptimeMillis()
             var streaming: Attempt? = null
             var active = 0
-            var newest: Attempt? = null
-            var oldest: Attempt? = null
+            var silent: Attempt? = null
             for (a in live) {
                 if (a.lines > 0 && streaming == null) streaming = a
                 if (!a.done) {
                     active++
-                    if (newest == null || a.startAt > newest.startAt) newest = a
-                    if (oldest == null || a.startAt < oldest.startAt) oldest = a
+                    if (a.lines == 0 && (silent == null || a.startAt > silent.startAt)) silent = a
                 }
             }
             if (streaming != null) {
+                // One answer has started: the other request that is still silent is not needed any more.
                 for (a in live) {
-                    if (a === streaming || a.done) continue
-                    if (a.lines == 0 && !a.slot.cancelled) {
-                        a.slot.cancel()
-                        markSlow(a.combo)
-                    }
+                    if (a === streaming || a.done || a.lines > 0 || a.slot.cancelled) continue
+                    a.slot.cancel()
+                    if (now - a.startAt >= FIRST_WAIT_MS) noteSlow(a, texts.size)
                 }
                 for (a in live) {
                     if (!a.done && a.lines > 0 && !a.slot.cancelled && now - a.lastAt > STALL_MS) {
-                        logEvent("⏸ " + comboName(j, a.combo) + " — মাঝপথে থেমে গেছে, বাকি লেখা পরেরটায়")
+                        logEvent("⏸ " + comboName(j, a.combo) + " — " + STALL_MS / 1000L + " সেকেন্ড ধরে থেমে আছে, বাকি লেখা অন্যটায় পাঠানো হচ্ছে")
                         a.slot.cancel()
-                        markSlow(a.combo)
+                        noteSlow(a, texts.size)
                     }
                 }
             }
             if (active == 0) {
                 if (streaming != null) break
-                if (!launchNext()) {
+                if (waitUntil > 0L) {
+                    if (now < waitUntil) continue
+                    waitUntil = 0L
+                }
+                if (live.size >= MAX_ATTEMPTS || j.attempts.get() >= JOB_MAX_ATTEMPTS ||
+                    j.netFails.get() >= NET_FAIL_MAX
+                ) {
                     noMore = true
                     break
                 }
+                val p = pickNext(j, models, tried, false, null, true)
+                if (p == null) {
+                    noMore = true
+                    break
+                }
+                val left = p.until - System.currentTimeMillis()
+                if (left > READY_SLACK_MS) {
+                    j.coolTries.incrementAndGet()
+                    waitUntil = now + left
+                    logEvent("⏳ " + comboName(j, p.combo) + " — একটু বিশ্রামে আছে, " + (left + 999L) / 1000L + " সেকেন্ড পরে আবার চেষ্টা হবে")
+                    continue
+                }
+                if (p.suspect) j.coolTries.incrementAndGet()
+                if (isBig(p.combo.model)) noteBig(j, p.combo)
+                start(p.combo)
                 continue
             }
-            if (streaming == null && newest != null) {
-                val waited = now - newest.startAt
-                if (waited > firstLineLimit(newest.combo.model)) {
-                    if (active < MAX_LIVE) {
-                        if (launchNext() && !newest.flagged) {
-                            newest.flagged = true
-                            logEvent("⏱ " + comboName(j, newest.combo) + " — " + waited / 1000L + " সেকেন্ডে উত্তর আসেনি, পাশাপাশি পরেরটায় পাঠানো হলো")
-                        }
-                    } else if (oldest != null && now - oldest.startAt > FIRST_LINE_MAX_MS) {
-                        oldest.slot.cancel()
-                        markSlow(oldest.combo)
-                        launchNext()
+            if (streaming == null && silent != null && active < MAX_LIVE && hedges < MAX_HEDGES && now >= hedgeCheckAt) {
+                val waited = now - silent.startAt
+                if (waited >= FIRST_WAIT_MS) {
+                    var p: Pick? = null
+                    if (live.size < MAX_ATTEMPTS && j.attempts.get() < JOB_MAX_ATTEMPTS &&
+                        j.netFails.get() < NET_FAIL_MAX
+                    ) {
+                        p = pickNext(j, models, tried, true, silent.combo.model, false)
+                    }
+                    if (p != null) {
+                        hedges++
+                        start(p.combo)
+                        logEvent("⏱ " + comboName(j, silent.combo) + " — " + waited / 1000L + " সেকেন্ডেও উত্তর আসেনি, এটাকে না থামিয়ে পাশাপাশি " + comboName(j, p.combo) + " দিয়েও পাঠানো হলো")
+                    } else {
+                        hedgeCheckAt = now + 1000L
                     }
                 }
             }
@@ -1856,6 +1886,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         return GroupResult(lines, completed, noMore)
     }
+
     private fun runTextAttempt(j: Job, a: Attempt, texts: List<String>, sys: String, prompt: String,
                                level: String, answered: MutableSet<String>) {
         var code = -1
@@ -1890,7 +1921,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val src = texts[n - 1]
         val now = SystemClock.uptimeMillis()
         if (a.lines == 0) {
-            recordFirst(a.combo.model, now - a.startAt)
+            modelOk(a.combo.model)
             saveCurrentCombo(j, a.combo)
         }
         a.lines = a.lines + 1
@@ -2259,13 +2290,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
         val full = j.items.size < 4
         val prompt = buildShotPrompt(known, full)
         val models = imageModels(j)
-        val tried = HashSet<String>()
+        val tried = HashMap<String, Int>()
         val live = ArrayList<Attempt>()
+        var hedged = false
 
-        fun launchNext(): Boolean {
-            if (live.size >= MAX_ATTEMPTS || j.attempts.get() >= JOB_MAX_ATTEMPTS) return false
-            val c = pickNext(j, models, tried) ?: return false
-            tried.add(c.tag)
+        fun start(c: Combo) {
+            tried[c.tag] = (tried[c.tag] ?: 0) + 1
+            j.transient.remove(c.tag)
             j.attempts.incrementAndGet()
             val a = Attempt(c, SystemClock.uptimeMillis())
             j.slots.add(a.slot)
@@ -2275,6 +2306,16 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 a.code = -1
                 a.done = true
             }
+        }
+
+        fun launchNext(): Boolean {
+            if (live.size >= MAX_ATTEMPTS || j.attempts.get() >= JOB_MAX_ATTEMPTS ||
+                j.netFails.get() >= NET_FAIL_MAX
+            ) return false
+            val p = pickNext(j, models, tried, false, null, false) ?: return false
+            if (p.suspect) j.coolTries.incrementAndGet()
+            if (isBig(p.combo.model)) noteBig(j, p.combo)
+            start(p.combo)
             return true
         }
 
@@ -2304,10 +2345,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 if (!launchNext()) break
                 continue
             }
-            if (active < MAX_LIVE && newest != null &&
-                SystemClock.uptimeMillis() - newest.startAt > IMAGE_HEDGE_MS
+            if (!hedged && active < MAX_LIVE && newest != null &&
+                SystemClock.uptimeMillis() - newest.startAt >= IMAGE_WAIT_MS
             ) {
-                launchNext()
+                hedged = true
+                if (live.size < MAX_ATTEMPTS && j.attempts.get() < JOB_MAX_ATTEMPTS) {
+                    val p = pickNext(j, models, tried, true, newest.combo.model, false)
+                    if (p != null) start(p.combo)
+                }
             }
         }
         for (a in live) {
@@ -2350,7 +2395,10 @@ class TranslatorAccessibilityService : AccessibilityService() {
             code = -1
         }
         if (a.slot.cancelled) code = -2
-        if (code == 200) saveCurrentCombo(j, a.combo)
+        if (code == 200) {
+            modelOk(a.combo.model)
+            saveCurrentCombo(j, a.combo)
+        }
         if (code != 200 && code != -2) {
             markBad(j, a, code)
             noteCode(j, code)
@@ -2649,36 +2697,62 @@ class TranslatorAccessibilityService : AccessibilityService() {
     // Keys, models, speed and rest times
     // ---------------------------------------------------------------------
 
-    private fun pickNext(j: Job, models: List<String>, tried: Set<String>): Combo? {
+    private fun pickNext(j: Job, models: List<String>, tried: Map<String, Int>, hedge: Boolean,
+                         avoid: String?, canWait: Boolean): Pick? {
+        // Order: fast models that are free now, then a fast model that is free within a few seconds
+        // (worth waiting for), and only after that the big models, which are kept as the last resort.
+        // A parallel backup (hedge) only ever goes to a fast model that is free right now.
         val now = System.currentTimeMillis()
-        var best: Combo? = null
+        val soft = !hedge && j.coolTries.get() < COOL_TRIES_MAX
+        var maxWait = 0L
+        if (soft && canWait) {
+            maxWait = j.deadline - SystemClock.uptimeMillis() - WAIT_MARGIN_MS
+            if (maxWait > WAIT_MAX_MS) maxWait = WAIT_MAX_MS
+            if (maxWait < 0L) maxWait = 0L
+        }
+        var best: Pick? = null
         var bestScore = Long.MAX_VALUE
-        var bestUntil = 0L
         for (mi in models.indices) {
             val m = models[mi]
+            val big = isBig(m)
+            if (hedge && big) continue
             val suspect = isSuspect(m, j.keys.size, now)
+            if (suspect && !soft) continue
+            val busy = synchronized(comboLock) { modelBusy[m] ?: 0L }
             for (ki in j.keys.indices) {
                 val c = Combo(j.keys[ki], m)
-                if (tried.contains(c.tag) || j.badCombos.contains(c.tag)) continue
-                val until = synchronized(comboLock) { cooldown[c.tag] ?: 0L }
-                var s = mi.toLong() * 100L + ki.toLong()
-                if (suspect) s += 10000L
-                if (until > now) s += 1000000L + (until - now) / 1000L
+                if (j.badCombos.contains(c.tag)) continue
+                val n = tried[c.tag] ?: 0
+                if (n >= 2 || (n == 1 && !j.transient.contains(c.tag))) continue
+                var until = synchronized(comboLock) { cooldown[c.tag] ?: 0L }
+                if (busy > until) until = busy
+                val left = until - now
+                val cooling = left > READY_SLACK_MS
+                if (cooling && left > maxWait) continue
+                var tier = if (cooling) 2L else if (suspect) 1L else 0L
+                if (big) tier += 3L
+                var s = tier * 1000000000L + mi.toLong() * 100L + ki.toLong()
+                if (cooling) s += (left / 1000L) * 10000L
+                if (avoid != null && m == avoid) s += 5000L
                 if (s < bestScore) {
-                    best = c
                     bestScore = s
-                    bestUntil = until
+                    best = Pick(c, if (cooling) until else 0L, suspect && !cooling)
                 }
             }
         }
-        val b = best ?: return null
-        if (bestUntil > now) {
-            if (bestUntil - now > 65000L) return null
-            if (j.coolTries.incrementAndGet() > 2) return null
-        } else if (bestScore >= 10000L) {
-            if (j.coolTries.incrementAndGet() > 2) return null
+        return best
+    }
+
+    private fun isBig(model: String): Boolean {
+        return BIG_MODELS.contains(model)
+    }
+
+    private fun noteBig(j: Job, c: Combo) {
+        var light = false
+        for (m in j.models) {
+            if (!isBig(m)) light = true
         }
-        return b
+        if (light) logEvent("⚠ দ্রুত মডেলগুলো এখন পাওয়া যাচ্ছে না, তাই শেষ উপায় হিসেবে " + comboName(j, c) + " দিয়ে চেষ্টা হচ্ছে")
     }
 
     private fun isSuspect(model: String, keyCount: Int, now: Long): Boolean {
@@ -2695,12 +2769,13 @@ class TranslatorAccessibilityService : AccessibilityService() {
     private fun markBad(j: Job, a: Attempt, code: Int) {
         val c = a.combo
         val now = System.currentTimeMillis()
+        val busy = code in 500..599
         var rest = when {
             code == 4290 -> nextPacificMidnight() - now
             code == 429 -> if (a.retryMs > 0L) a.retryMs + 1000L else 60000L
             code == 401 || code == 403 || code == 404 -> 600000L
-            code >= 500 -> 15000L
-            code == -1 -> 8000L
+            busy -> busyRest(c.model, now)
+            code == -1 -> 4000L
             else -> 20000L
         }
         if (code == 429) {
@@ -2709,9 +2784,25 @@ class TranslatorAccessibilityService : AccessibilityService() {
         }
         if (rest < 1000L) rest = 1000L
         val until = now + rest
+        val same = ArrayList<String>()
+        same.add(c.tag)
+        if (code == 404) {
+            // The model itself is missing: no key will work with it.
+            for (k in j.keys) same.add(k + "|" + c.model)
+        } else if (code == 401) {
+            // The key itself is wrong: no model will work with it.
+            for (m in ALL_MODELS) same.add(c.key + "|" + m)
+        }
         synchronized(comboLock) {
-            val old = cooldown[c.tag] ?: 0L
-            if (until > old) cooldown[c.tag] = until
+            for (t in same) {
+                val old = cooldown[t] ?: 0L
+                if (until > old) cooldown[t] = until
+            }
+            if (busy) {
+                // Server busy is about the whole model, not one key: every key of this model rests.
+                val ob = modelBusy[c.model] ?: 0L
+                if (until > ob) modelBusy[c.model] = until
+            }
             if (code == 429 || code == 4290) {
                 var m = model429[c.model]
                 if (m == null) {
@@ -2721,16 +2812,45 @@ class TranslatorAccessibilityService : AccessibilityService() {
                 m[c.key] = now
             }
         }
-        j.badCombos.add(c.tag)
+        if (code == 429 || busy || code == -1) {
+            j.transient.add(c.tag)
+        } else {
+            j.badCombos.addAll(same)
+        }
+        if (code == -1) j.netFails.incrementAndGet()
         if (code == 404) markDead(c.model)
         logEvent("✗ " + comboName(j, c) + " — " + reasonText(code, rest, until))
     }
-    private fun markSlow(c: Combo) {
+
+    private fun busyRest(model: String, now: Long): Long {
         synchronized(comboLock) {
-            val until = System.currentTimeMillis() + 15000L
-            val old = cooldown[c.tag] ?: 0L
-            if (until > old) cooldown[c.tag] = until
+            val cur = modelBusy[model] ?: 0L
+            if (cur > now + 1000L) return cur - now
+            val n = (busyCount[model] ?: 0) + 1
+            busyCount[model] = n
+            var r = BUSY_BASE_MS
+            var i = 1
+            while (i < n && r < BUSY_MAX_MS) {
+                r *= 2L
+                i++
+            }
+            if (r > BUSY_MAX_MS) r = BUSY_MAX_MS
+            return r
         }
+    }
+
+    private fun modelOk(model: String) {
+        synchronized(comboLock) {
+            busyCount.remove(model)
+            modelBusy.remove(model)
+        }
+    }
+
+    private fun noteSlow(a: Attempt, units: Int) {
+        if (a.recorded) return
+        a.recorded = true
+        val took = SystemClock.uptimeMillis() - a.startAt
+        recordSpeed(a.combo.model, took, 4 + units)
     }
 
     private fun noteCode(j: Job, code: Int) {
@@ -2738,28 +2858,19 @@ class TranslatorAccessibilityService : AccessibilityService() {
         j.lastCode = code
     }
 
-    private fun firstLineLimit(model: String): Long {
-        val base = synchronized(speedLock) { firstLat[model] }
-        var t = if (base != null) (base * 2.0).toLong() else FIRST_LINE_LIMIT_MS
-        if (t < FIRST_LINE_MIN_MS) t = FIRST_LINE_MIN_MS
-        if (t > FIRST_LINE_LIMIT_MS) t = FIRST_LINE_LIMIT_MS
-        return t
-    }
-    private fun recordFirst(model: String, ms: Long) {
-        if (ms <= 0L) return
-        synchronized(speedLock) {
-            val old = firstLat[model]
-            firstLat[model] = if (old == null) ms.toDouble() else old * 0.6 + ms.toDouble() * 0.4
-        }
-    }
-
     private fun imageModels(j: Job): List<String> {
-        if (j.auto) return deadLast(IMAGE_PREF)
-        val out = ArrayList<String>()
+        val base = ArrayList<String>()
         for (m in IMAGE_PREF) {
-            if (j.models.contains(m)) out.add(m)
+            if (j.auto || j.models.contains(m)) base.add(m)
         }
-        return if (out.isEmpty()) j.models else out
+        if (base.isEmpty()) return j.models
+        val light = ArrayList<String>()
+        val big = ArrayList<String>()
+        for (m in deadLast(base)) {
+            if (isBig(m)) big.add(m) else light.add(m)
+        }
+        light.addAll(big)
+        return light
     }
 
     private fun deadLast(list: List<String>): List<String> {
@@ -2802,7 +2913,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
         if (p.getBoolean("model3", true)) models.add(ALL_MODELS[2])
         if (p.getBoolean("model4", false)) models.add(ALL_MODELS[3])
         if (p.getBoolean("model5", false)) models.add(ALL_MODELS[4])
-        return models
+        return rankModels(models)
     }
 
     private fun loadSpeeds() {
@@ -2876,11 +2987,19 @@ class TranslatorAccessibilityService : AccessibilityService() {
     }
 
     private fun rankModels(list: List<String>): List<String> {
+        // Fastest measured model first. The big models always come after the fast ones.
         val score = HashMap<String, Double>()
         for (m in list) score[m] = speedOf(m) ?: priorSpeed(m)
-        val out = ArrayList<String>(list)
-        out.sortWith(Comparator { a, b -> java.lang.Double.compare(score[a] ?: 0.0, score[b] ?: 0.0) })
-        return out
+        val cmp = Comparator<String> { a, b -> java.lang.Double.compare(score[a] ?: 0.0, score[b] ?: 0.0) }
+        val light = ArrayList<String>()
+        val big = ArrayList<String>()
+        for (m in list) {
+            if (isBig(m)) big.add(m) else light.add(m)
+        }
+        light.sortWith(cmp)
+        big.sortWith(cmp)
+        light.addAll(big)
+        return light
     }
 
     private fun saveCurrentCombo(j: Job, c: Combo) {
@@ -2928,7 +3047,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
             code == 429 -> "মিনিটের লিমিট শেষ, " + secs + " সেকেন্ড বিশ্রাম"
             code == 401 || code == 403 -> "key কাজ করছে না (" + code + "), 10 মিনিট বাদ"
             code == 404 -> "মডেল পাওয়া যায়নি (404), 10 মিনিট বাদ"
-            code >= 500 -> "Google সার্ভার ব্যস্ত (" + code + "), " + secs + " সেকেন্ড বিশ্রাম"
+            code in 500..599 -> "Google সার্ভার ব্যস্ত (" + code + "), এই মডেল " + secs + " সেকেন্ড বিশ্রাম"
             code == -1 -> "নেট সমস্যা, " + secs + " সেকেন্ড বিশ্রাম"
             code == 204 -> "খালি উত্তর এসেছে, " + secs + " সেকেন্ড বিশ্রাম"
             code == 400 -> "অনুরোধ নেয়নি (400), " + secs + " সেকেন্ড বিশ্রাম"
@@ -3137,14 +3256,17 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val MAX_FOUND = 500
         private const val MAX_ITEMS = 200
         private const val MAX_TEXT_LEN = 1200
-        private const val PART_ITEMS = 16
-        private const val PART_CHARS = 900
-        private const val MAX_PARTS = 3
+        private const val PART_ITEMS = 30
+        private const val PART_CHARS = 1500
+        private const val MAX_PARTS = 2
         private const val FIX_MAX = 80
-        private const val MAX_GROUPS = 4
+        private const val MAX_GROUPS = 3
         private const val MAX_LIVE = 2
-        private const val MAX_ATTEMPTS = 8
-        private const val JOB_MAX_ATTEMPTS = 24
+        private const val MAX_HEDGES = 2
+        private const val MAX_ATTEMPTS = 6
+        private const val JOB_MAX_ATTEMPTS = 8
+        private const val COOL_TRIES_MAX = 2
+        private const val NET_FAIL_MAX = 3
         private const val OCR_MAX = 40
         private const val OCR_TIMEOUT_MS = 4000L
         private const val SHOT_DELAY_MS = 100L
@@ -3162,11 +3284,14 @@ class TranslatorAccessibilityService : AccessibilityService() {
         private const val DRAW_GATE_MS = 1500L
         private const val DRAW_THROTTLE_MS = 90L
         private const val VERIFY_DELAY_MS = 300L
-        private const val FIRST_LINE_LIMIT_MS = 2000L
-        private const val FIRST_LINE_MIN_MS = 1500L
-        private const val FIRST_LINE_MAX_MS = 4000L
-        private const val STALL_MS = 2000L
-        private const val IMAGE_HEDGE_MS = 8000L
+        private const val FIRST_WAIT_MS = 6500L
+        private const val STALL_MS = 6000L
+        private const val IMAGE_WAIT_MS = 10000L
+        private const val WAIT_MAX_MS = 10000L
+        private const val WAIT_MARGIN_MS = 6000L
+        private const val READY_SLACK_MS = 250L
+        private const val BUSY_BASE_MS = 5000L
+        private const val BUSY_MAX_MS = 60000L
         private const val SUSPECT_MS = 90000L
         private const val LOG_MAX = 150
         private const val POLL_MS = 60L
@@ -3185,6 +3310,7 @@ class TranslatorAccessibilityService : AccessibilityService() {
             "gemini-3.8-flash",
             "gemini-3.6-flash"
         )
+        private val BIG_MODELS = setOf("gemini-3.8-flash", "gemini-3.6-flash")
         private val IMAGE_PREF = listOf(
             "gemini-3.5-flash-lite",
             "gemini-3.6-flash",
